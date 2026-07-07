@@ -17,7 +17,7 @@ type Player = {
   holeCards?: Card[]
 }
 type TableEvent = { seq: number; time: number; type: string; data: Record<string, unknown> }
-type Payout = { playerId: string; chips: number; txHash?: string; error?: string }
+type Payout = { playerId: string; address: string; chips: number; txHash?: string; error?: string }
 type TableState = {
   state: 'waiting' | 'playing' | 'settling' | 'settled'
   handNumber: number
@@ -190,6 +190,22 @@ export function SpectatorTable() {
           <h2>Last Move</h2>
           <p className="event-copy">{latestAction ? describeEvent(latestAction) : 'No action yet.'}</p>
         </div>
+        {table.payouts.length ? (
+          <div className="panel-section">
+            <h2>Settlement</h2>
+            <div className="receipt-list">
+              {table.payouts.map((payout) => (
+                <div className="receipt-row" key={payout.playerId}>
+                  <div>
+                    <strong>{payout.playerId}</strong>
+                    <span>{usd(payout.chips)} to {shortAddress(payout.address)}</span>
+                  </div>
+                  <code>{payout.txHash ? shortHash(payout.txHash) : payout.error ?? 'pending'}</code>
+                </div>
+              ))}
+            </div>
+          </div>
+        ) : null}
         <div className="panel-section grow">
           <h2>Live Log</h2>
           <div className="event-list">
@@ -304,4 +320,8 @@ function usd(chips: number): string {
 
 function shortAddress(address: string): string {
   return `${address.slice(0, 6)}…${address.slice(-4)}`
+}
+
+function shortHash(hash: string): string {
+  return `${hash.slice(0, 10)}…${hash.slice(-6)}`
 }

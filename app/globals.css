@@ -402,6 +402,46 @@ h1 {
   line-height: 1.55;
 }
 
+.receipt-list {
+  margin-top: 12px;
+  display: grid;
+  gap: 10px;
+}
+
+.receipt-row {
+  border: 1px solid rgba(126, 231, 135, 0.22);
+  border-radius: 8px;
+  padding: 10px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  background: rgba(126, 231, 135, 0.06);
+}
+
+.receipt-row div {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.receipt-row strong {
+  color: var(--ink);
+  font-size: 13px;
+}
+
+.receipt-row span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.receipt-row code {
+  color: var(--green);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
 .event-list {
   margin-top: 12px;
   overflow: auto;
