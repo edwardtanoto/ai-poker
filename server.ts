@@ -14,6 +14,15 @@ const nextHandler = nextApp.getRequestHandler()
 
 const treasury = await openWallet('treasury', '.wallets/treasury.json')
 console.log(`[server] treasury: ${treasury.address}`)
+const hasLlmKey = Boolean(
+  process.env.POKER_PROVIDER ||
+    process.env.ANTHROPIC_API_KEY ||
+    process.env.ANTHROPIC_AUTH_TOKEN ||
+    process.env.OPENAI_API_KEY ||
+    process.env.GOOGLE_GENERATIVE_AI_API_KEY ||
+    process.env.GOOGLE_API_KEY,
+)
+console.log(`[server] agent brain: ${hasLlmKey ? 'LLM' : 'rule-based fallback'}`)
 const { app: tableApp } = createTableApp(treasury)
 
 await nextApp.prepare()
@@ -21,7 +30,7 @@ await nextApp.prepare()
 http.createServer(async (req, res) => {
   try {
     const path = new URL(req.url ?? '/', requestOrigin(req)).pathname
-    if (path === '/api/health' || path.startsWith('/api/table')) {
+    if (path.startsWith('/api/')) {
       await handleHonoRequest(req, res)
       return
     }

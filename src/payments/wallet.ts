@@ -30,9 +30,15 @@ function makeClient(account: PrivateKeyAccount) {
 
 /**
  * Loads a persisted wallet or creates a fresh one, then tops it up from the
- * Tempo testnet faucet when the pathUSD balance is low.
+ * Tempo testnet faucet when the pathUSD balance is low. Pass
+ * `{ autofund: false }` for wallets that must start empty (e.g. spectator
+ * wallets funded with fixed top-ups from the treasury).
  */
-export async function openWallet(name: string, keyFile: string): Promise<Wallet> {
+export async function openWallet(
+  name: string,
+  keyFile: string,
+  options: { autofund?: boolean } = {},
+): Promise<Wallet> {
   let privateKey: `0x${string}`
   if (existsSync(keyFile)) {
     privateKey = JSON.parse(readFileSync(keyFile, 'utf8')).privateKey
@@ -66,7 +72,7 @@ export async function openWallet(name: string, keyFile: string): Promise<Wallet>
     },
   }
 
-  await ensureFunded(wallet, name)
+  if (options.autofund !== false) await ensureFunded(wallet, name)
   return wallet
 }
 

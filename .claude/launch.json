@@ -4,8 +4,17 @@
     {
       "name": "poker-server",
       "runtimeExecutable": "npx",
-      "runtimeArgs": ["tsx", "src/server/index.ts"],
+      "runtimeArgs": ["tsx", "server.ts"],
       "port": 4021
+    },
+    {
+      "name": "poker-rulebot",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": [
+        "-c",
+        "PORT=4032 MAX_HANDS=30 POKER_PROVIDER= ANTHROPIC_API_KEY= ANTHROPIC_AUTH_TOKEN= OPENAI_API_KEY= GOOGLE_GENERATIVE_AI_API_KEY= GOOGLE_API_KEY= npx tsx server.ts"
+      ],
+      "port": 4032
     }
   ]
 }

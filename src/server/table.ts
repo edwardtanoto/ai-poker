@@ -39,9 +39,11 @@ export class Table {
   private logCursor = 0
   private listeners = new Set<(e: TableEvent) => void>()
   private readonly payoutFn: PayoutFn
+  readonly targetSeats: number
 
-  constructor(payoutFn: PayoutFn) {
+  constructor(payoutFn: PayoutFn, targetSeats: number = TABLE_SEATS) {
     this.payoutFn = payoutFn
+    this.targetSeats = Math.max(2, Math.min(Math.floor(targetSeats) || 2, 4))
   }
 
   subscribe(fn: (e: TableEvent) => void): () => void {
@@ -72,9 +74,9 @@ export class Table {
     }
     this.seats.push(seat)
     this.emit('player_joined', {
-      playerId, address, buyIn: formatUsd(BUY_IN_CHIPS), seats: this.seats.length, needed: TABLE_SEATS,
+      playerId, address, buyIn: formatUsd(BUY_IN_CHIPS), seats: this.seats.length, needed: this.targetSeats,
     })
-    if (this.seats.length >= TABLE_SEATS) this.startHand()
+    if (this.seats.length >= this.targetSeats) this.startHand()
     return seat
   }
 

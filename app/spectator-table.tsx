@@ -1,8 +1,6 @@
 'use client'
 
-import { useCallback, useEffect, useMemo, useState } from 'react'
-import type { ReactNode } from 'react'
-import { Brain, CircleDollarSign, Play, RotateCcw, ShieldCheck, Sparkles, WalletCards } from 'lucide-react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 type Suit = 'c' | 'd' | 'h' | 's'
 type Card = { rank: number; suit: Suit }
@@ -33,15 +31,29 @@ type TableState = {
   } | null
   payouts: Payout[]
 }
+type SpectatorBet = {
+  id: string
+  agentId: string
+  amount: number
+  multiplier: number
+  status: 'open' | 'won' | 'lost' | 'refunded'
+}
+type BetState = {
+  open: boolean
+  multiplier: number
+  pools: Record<string, number>
+  myBets: SpectatorBet[]
+  balance: number | null
+}
 
 const SUITS: Record<Suit, string> = { c: '♣', d: '♦', h: '♥', s: '♠' }
 const RANKS: Record<number, string> = { 11: 'J', 12: 'Q', 13: 'K', 14: 'A' }
-const PERSONA_BLURBS: Record<string, string> = {
-  'ace-bot': 'tight-aggressive math grinder',
-  'river-rat': 'loose trickster, river pressure',
-  'bluff-machine': 'fearless pressure engine',
-  'tilt-proof': 'calm GTO-leaning adjuster',
+const SEAT_POSITIONS: Record<number, string[]> = {
+  2: ['pos-bottom', 'pos-top'],
+  3: ['pos-bottom', 'pos-top-left', 'pos-top-right'],
+  4: ['pos-bottom', 'pos-left', 'pos-top', 'pos-right'],
 }
+const BET_PRESETS = [1, 5, 20]
 
 const initialTable: TableState = {
   state: 'waiting',
@@ -58,24 +70,63 @@ export function SpectatorTable() {
   const [events, setEvents] = useState<TableEvent[]>([])
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [seatCount, setSeatCount] = useState(2)
+
+  const [spectatorId, setSpectatorId] = useState<string | null>(null)
+  const [betState, setBetState] = useState<BetState | null>(null)
+  const [pickedAgent, setPickedAgent] = useState<string | null>(null)
+  const [betAmount, setBetAmount] = useState(5)
+  const [walletBusy, setWalletBusy] = useState(false)
+  const [myBetIds, setMyBetIds] = useState<string[]>([])
+
+  const fetchSeq = useRef(0)
+  const spectatorRef = useRef<string | null>(null)
 
   const refresh = useCallback(async () => {
+    const seq = ++fetchSeq.current
     const res = await fetch('/api/table', { cache: 'no-store' })
     if (!res.ok) throw new Error(`table fetch failed: ${res.status}`)
-    setTable(await res.json())
+    const next = (await res.json()) as TableState
+    if (seq === fetchSeq.current) setTable(next)
   }, [])
+
+  const refreshBets = useCallback(async () => {
+    const id = spectatorRef.current
+    const res = await fetch(`/api/bets/state${id ? `?spectatorId=${id}` : ''}`, { cache: 'no-store' })
+    if (res.ok) setBetState(await res.json())
+  }, [])
+
+  // Spectator session: server-custodial testnet wallet keyed by a local id.
+  useEffect(() => {
+    const stored = localStorage.getItem('pokerSpectatorId') ?? undefined
+    void fetch('/api/bets/session', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ spectatorId: stored }),
+    })
+      .then((res) => res.json())
+      .then((session: { spectatorId: string; balance: number }) => {
+        localStorage.setItem('pokerSpectatorId', session.spectatorId)
+        spectatorRef.current = session.spectatorId
+        setSpectatorId(session.spectatorId)
+        void refreshBets()
+      })
+      .catch(() => setError('Could not open your wallet session.'))
+  }, [refreshBets])
 
   useEffect(() => {
     void refresh().catch((err) => setError(err instanceof Error ? err.message : String(err)))
     const source = new EventSource('/api/table/events')
+    source.onopen = () => setError(null)
     source.onmessage = (message) => {
       const event = JSON.parse(message.data) as TableEvent
+      if (event.type === 'demo_started') setMyBetIds([])
       setEvents((prev) => [...prev.slice(-159), event])
       void refresh()
+      void refreshBets()
     }
-    source.onerror = () => setError('Live stream disconnected. Refreshing still works.')
     return () => source.close()
-  }, [refresh])
+  }, [refresh, refreshBets])
 
   const players = useMemo(() => {
     return table.seats.map((seat) => {
@@ -84,14 +135,50 @@ export function SpectatorTable() {
     })
   }, [table])
 
-  const startMatch = async () => {
+  const lastChat = useMemo(() => {
+    const map: Record<string, string> = {}
+    for (const event of events) {
+      if (event.type === 'chat' && typeof event.data.say === 'string') {
+        map[String(event.data.playerId)] = event.data.say
+      }
+    }
+    return map
+  }, [events])
+
+  const latestEvent = useMemo(() => {
+    for (let i = events.length - 1; i >= 0; i--) {
+      const line = describeEvent(events[i]!)
+      if (line) return { key: `${events[i]!.time}-${events[i]!.seq}`, line }
+    }
+    return null
+  }, [events])
+
+  const balance = betState?.balance ?? null
+  const bettingOpen = Boolean(betState?.open) && table.state === 'playing'
+  const winnerId = useMemo(() => {
+    if (table.state !== 'settled' || !table.payouts.length) return null
+    const top = Math.max(...table.payouts.map((p) => p.chips))
+    const winners = table.payouts.filter((p) => p.chips === top)
+    return winners.length === 1 ? winners[0]!.playerId : null
+  }, [table])
+
+  const myResolvedBets = useMemo(
+    () => (betState?.myBets ?? []).filter((b) => myBetIds.includes(b.id) && (b.status === 'won' || b.status === 'lost')),
+    [betState, myBetIds],
+  )
+  const myOpenBets = useMemo(
+    () => (betState?.myBets ?? []).filter((b) => myBetIds.includes(b.id) && b.status === 'open'),
+    [betState, myBetIds],
+  )
+
+  const startMatch = async (seats: number) => {
     setBusy(true)
     setError(null)
     try {
       const res = await fetch('/api/table/start', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ seats: 2 }),
+        body: JSON.stringify({ seats }),
       })
       if (!res.ok) throw new Error(await res.text())
       await refresh()
@@ -102,211 +189,355 @@ export function SpectatorTable() {
     }
   }
 
-  const resetMatch = async () => {
+  const playAgain = async () => {
     setBusy(true)
     setError(null)
     try {
-      const res = await fetch('/api/table/reset', { method: 'POST' })
-      if (!res.ok) throw new Error(await res.text())
+      await fetch('/api/table/reset', { method: 'POST' })
       setEvents([])
-      await refresh()
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
+      await startMatch(seatCount)
     } finally {
       setBusy(false)
     }
   }
 
-  const latestThought = [...events].reverse().find((event) => event.type === 'thought')
-  const latestAction = [...events].reverse().find((event) => event.type === 'action' || event.type === 'hand_end')
+  const topup = async () => {
+    if (!spectatorId) return
+    setWalletBusy(true)
+    try {
+      const res = await fetch('/api/bets/topup', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ spectatorId }),
+      })
+      if (!res.ok) throw new Error((await res.json().catch(() => ({})) as { error?: string }).error ?? 'Top up failed')
+      await refreshBets()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setWalletBusy(false)
+    }
+  }
+
+  const placeBet = async () => {
+    if (!spectatorId || !pickedAgent) return
+    setWalletBusy(true)
+    setError(null)
+    try {
+      const res = await fetch('/api/bets/place', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ spectatorId, agentId: pickedAgent, amount: betAmount }),
+      })
+      const data = (await res.json()) as { bet?: SpectatorBet; error?: string }
+      if (!res.ok || !data.bet) throw new Error(data.error ?? 'Bet failed')
+      setMyBetIds((prev) => [...prev, data.bet!.id])
+      await refreshBets()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setWalletBusy(false)
+    }
+  }
+
+  const needsTopup = balance !== null && balance < betAmount * 1e6
 
   return (
-    <main className="arena-shell">
-      <section className="command-rail" aria-label="Match controls and status">
-        <div>
-          <div className="brand-row">
-            <span className="brand-mark">AI</span>
-            <span>AI Poker Arena</span>
-          </div>
-          <h1>Autonomous agents playing x402 poker.</h1>
-          <p>
-            Spectators see every card and every on-chain receipt. Agents only receive their private table view.
-          </p>
+    <div className="arena">
+      <header className="topbar">
+        <div className="brand">
+          <span className="brand-suit">♠</span> Poker Arena
         </div>
-
-        <div className="control-row">
-          <button type="button" className="primary-button" onClick={startMatch} disabled={busy || table.state === 'playing' || table.state === 'settling'}>
-            <Play aria-hidden size={18} />
-            Start match
-          </button>
-          <button type="button" className="icon-button" onClick={resetMatch} disabled={busy || table.state === 'settling'} title="Reset table">
-            <RotateCcw aria-hidden size={18} />
-          </button>
-        </div>
-
-        <div className="status-grid">
-          <Metric icon={<Sparkles size={16} />} label="State" value={table.state} />
-          <Metric icon={<WalletCards size={16} />} label="Hands" value={`${table.handNumber}/${table.maxHands || '∞'}`} />
-          <Metric icon={<CircleDollarSign size={16} />} label="Pot" value={table.hand ? usd(table.hand.pot) : '$0.00'} />
-          <Metric icon={<ShieldCheck size={16} />} label="Mode" value="testnet" />
-        </div>
-        {error ? <p className="error-line">{error}</p> : null}
-      </section>
-
-      <section className="table-stage" aria-label="Live poker table">
-        <div className="felt-table">
-          <div className="street-label">{table.hand?.street ?? 'waiting'}</div>
-          <div className="board-row">
-            {table.hand?.board.length ? table.hand.board.map((card, index) => <CardView key={`${card.rank}${card.suit}${index}`} card={card} />) : (
-              Array.from({ length: 5 }, (_, index) => <div className="card-slot" key={index} />)
-            )}
-          </div>
-          <div className="pot-display">
-            <span>Pot</span>
-            <strong>{table.hand ? usd(table.hand.pot) : '$0.00'}</strong>
-          </div>
-        </div>
-
-        <div className="seat-grid">
-          {players.length ? players.map((player) => (
-            <AgentSeat key={player.id} player={player} active={table.hand?.currentPlayerId === player.id} />
-          )) : (
-            <div className="empty-seat">
-              <Brain size={22} />
-              <span>No agents seated. Start a match to trigger testnet buy-ins.</span>
-            </div>
-          )}
-        </div>
-      </section>
-
-      <aside className="insight-panel" aria-label="Live match feed">
-        <div className="panel-section">
-          <h2>Agent Read</h2>
-          <p className="thought-copy">
-            {latestThought ? String(latestThought.data.thinking ?? '').slice(0, 260) : 'Waiting for the first model decision.'}
-          </p>
-        </div>
-        <div className="panel-section">
-          <h2>Last Move</h2>
-          <p className="event-copy">{latestAction ? describeEvent(latestAction) : 'No action yet.'}</p>
-        </div>
-        {table.payouts.length ? (
-          <div className="panel-section">
-            <h2>Settlement</h2>
-            <div className="receipt-list">
-              {table.payouts.map((payout) => (
-                <div className="receipt-row" key={payout.playerId}>
-                  <div>
-                    <strong>{payout.playerId}</strong>
-                    <span>{usd(payout.chips)} to {shortAddress(payout.address)}</span>
-                  </div>
-                  <code>{payout.txHash ? shortHash(payout.txHash) : payout.error ?? 'pending'}</code>
-                </div>
-              ))}
-            </div>
+        {table.state === 'playing' && table.hand ? (
+          <div className="hand-note">
+            Hand {table.handNumber} of {table.maxHands || '∞'}
           </div>
         ) : null}
-        <div className="panel-section grow">
-          <h2>Live Log</h2>
-          <div className="event-list">
-            {events.slice(-28).map((event) => (
-              <div className={`event-line ${event.type}`} key={event.seq}>
-                <time>{new Date(event.time).toLocaleTimeString()}</time>
-                <span>{describeEvent(event)}</span>
+        <div className="wallet-area">
+          <span className="balance" title="Your testnet balance">
+            {balance === null ? '—' : usd(balance)}
+          </span>
+          <button type="button" className="ghost-btn" onClick={topup} disabled={walletBusy || !spectatorId}>
+            {walletBusy ? 'Adding…' : '+$100'}
+          </button>
+        </div>
+      </header>
+
+      <main className="floor">
+        <div className="table-zone">
+          <div className="table-wrap">
+            <div className="pods">
+              {players.map((player, index) => (
+                <SeatPod
+                  key={player.id}
+                  player={player}
+                  posClass={SEAT_POSITIONS[players.length]?.[index] ?? 'pos-bottom'}
+                  active={table.hand?.currentPlayerId === player.id}
+                  chat={lastChat[player.id]}
+                  pool={betState?.pools[player.id] ?? 0}
+                  picked={myOpenBets.some((b) => b.agentId === player.id)}
+                  isWinner={winnerId === player.id}
+                />
+              ))}
+            </div>
+
+            <div className="oval">
+              <div className="table-center">
+              {table.hand ? (
+                <>
+                  <div className="street-note">{capitalize(table.hand.street)}</div>
+                  <div className="board-row">
+                    {table.hand.board.length
+                      ? table.hand.board.map((card, index) => (
+                          <CardView key={`${card.rank}${card.suit}${index}`} card={card} dealDelay={index * 80} />
+                        ))
+                      : Array.from({ length: 5 }, (_, index) => <div className="card-slot" key={index} />)}
+                  </div>
+                  <div className="pot-note">
+                    Pot <strong>{usd(table.hand.pot)}</strong>
+                  </div>
+                </>
+              ) : table.state === 'settled' ? (
+                <div className="result-block">
+                  <div className="result-trophy">🏆</div>
+                  <div className="result-title">{winnerId ? `${winnerId} takes the table` : 'Split table'}</div>
+                  <MyBetResult bets={myResolvedBets} />
+                  <button type="button" className="cta" onClick={playAgain} disabled={busy}>
+                    {busy ? 'Dealing…' : 'Play again'}
+                  </button>
+                </div>
+              ) : table.state === 'waiting' && players.length === 0 && !busy ? (
+                <div className="start-block">
+                  <p className="felt-tagline">AI pros. Real chips. One winner.</p>
+                  <div className="seat-choice" role="group" aria-label="Players at the table">
+                    {[2, 3, 4].map((n) => (
+                      <button
+                        key={n}
+                        type="button"
+                        className={seatCount === n ? 'selected' : ''}
+                        onClick={() => setSeatCount(n)}
+                      >
+                        {n}
+                      </button>
+                    ))}
+                  </div>
+                  <button type="button" className="cta" onClick={() => startMatch(seatCount)}>
+                    Start match
+                  </button>
+                </div>
+              ) : (
+                <div className="start-block">
+                  <p className="felt-tagline pulse">Seating players…</p>
+                </div>
+              )}
               </div>
-            ))}
+            </div>
           </div>
         </div>
-      </aside>
-    </main>
+
+        {players.length > 0 && table.state !== 'settled' ? (
+          <section className="bet-bar" aria-label="Back a player">
+            <span className="bet-label">
+              Pick the winner <em>pays {betState?.multiplier ?? players.length}×</em>
+            </span>
+            <div className="bet-agents">
+              {players.map((player) => (
+                <button
+                  key={player.id}
+                  type="button"
+                  className={pickedAgent === player.id ? 'selected' : ''}
+                  onClick={() => setPickedAgent(player.id)}
+                  disabled={!bettingOpen}
+                >
+                  {player.id}
+                </button>
+              ))}
+            </div>
+            <div className="bet-amounts">
+              {BET_PRESETS.map((amount) => (
+                <button
+                  key={amount}
+                  type="button"
+                  className={betAmount === amount ? 'selected' : ''}
+                  onClick={() => setBetAmount(amount)}
+                  disabled={!bettingOpen}
+                >
+                  ${amount}
+                </button>
+              ))}
+            </div>
+            {needsTopup ? (
+              <button type="button" className="cta small" onClick={topup} disabled={walletBusy}>
+                {walletBusy ? 'Adding…' : 'Top up to bet'}
+              </button>
+            ) : (
+              <button
+                type="button"
+                className="cta small"
+                onClick={placeBet}
+                disabled={!bettingOpen || !pickedAgent || walletBusy}
+              >
+                {walletBusy ? 'Placing…' : `Bet $${betAmount}`}
+              </button>
+            )}
+            {myOpenBets.length ? (
+              <span className="my-bet-note">
+                {myOpenBets.map((b) => `${usd(b.amount)} on ${b.agentId} → ${usd(b.amount * b.multiplier)} back`).join(' · ')}
+              </span>
+            ) : null}
+          </section>
+        ) : null}
+
+        {error ? <p className="error-note">{error}</p> : null}
+
+        <div className="ticker" aria-live="polite">
+          {latestEvent ? (
+            <span className="tick-line" key={latestEvent.key}>
+              {latestEvent.line}
+            </span>
+          ) : (
+            <span className="tick-line muted">Waiting for the action to start.</span>
+          )}
+        </div>
+      </main>
+    </div>
   )
 }
 
-function AgentSeat({ player, active }: { player: Player & { address: string; chips: number }; active: boolean }) {
+function SeatPod({
+  player,
+  posClass,
+  active,
+  chat,
+  pool,
+  picked,
+  isWinner,
+}: {
+  player: Player & { address: string; chips: number }
+  posClass: string
+  active: boolean
+  chat?: string
+  pool: number
+  picked: boolean
+  isWinner: boolean
+}) {
+  const folded = player.status === 'folded'
   return (
-    <article className={`agent-seat ${active ? 'active' : ''} ${player.status === 'folded' ? 'folded' : ''}`}>
-      <div className="agent-topline">
-        <div>
-          <h2>{player.id}</h2>
-          <p>{PERSONA_BLURBS[player.id] ?? 'adaptive poker model'}</p>
+    <div className={`pod ${posClass} ${active ? 'active' : ''} ${folded ? 'folded' : ''} ${isWinner ? 'winner' : ''}`}>
+      {chat ? <div className="bubble">{chat}</div> : null}
+      <div className="pod-head">
+        <span className="pod-avatar">{monogram(player.id)}</span>
+        <div className="pod-names">
+          <strong>{player.id}</strong>
+          <span>{usd(player.chips)}</span>
         </div>
-        <span className="provider-pill">Claude</span>
+        {picked ? <span className="pick-tag" title="Your pick">★</span> : null}
       </div>
-      <div className="hole-row">
-        {player.holeCards?.length ? player.holeCards.map((card, index) => <CardView key={`${card.rank}${card.suit}${index}`} card={card} compact />) : (
+      <div className="pod-cards">
+        {player.holeCards?.length ? (
+          player.holeCards.map((card, index) => (
+            <CardView key={`${card.rank}${card.suit}${index}`} card={card} compact dealDelay={index * 80} />
+          ))
+        ) : (
           <>
             <div className="card-back" />
             <div className="card-back" />
           </>
         )}
       </div>
-      <div className="agent-stats">
-        <span>{usd(player.chips)}</span>
-        <span>{player.status ?? 'seated'}</span>
-        <span>{player.streetBet ? `bet ${usd(player.streetBet)}` : 'no bet'}</span>
-      </div>
-      <p className="address-line">{shortAddress(player.address)}</p>
-    </article>
+      {folded ? <span className="pod-status">folded</span> : null}
+      {pool > 0 ? <span className="pod-pool">{usd(pool)} backed</span> : null}
+    </div>
   )
 }
 
-function CardView({ card, compact = false }: { card: Card; compact?: boolean }) {
+function MyBetResult({ bets }: { bets: SpectatorBet[] }) {
+  if (!bets.length) return null
+  const net = bets.reduce((sum, b) => sum + (b.status === 'won' ? b.amount * (b.multiplier - 1) : -b.amount), 0)
+  if (net > 0) return <p className="my-result won">You called it — +{usd(net)}</p>
+  if (net < 0) return <p className="my-result lost">Not this time — {usd(net)}</p>
+  return <p className="my-result">Break even</p>
+}
+
+function CardView({ card, compact = false, dealDelay = 0 }: { card: Card; compact?: boolean; dealDelay?: number }) {
   const red = card.suit === 'h' || card.suit === 'd'
   return (
-    <div className={`playing-card ${compact ? 'compact' : ''} ${red ? 'red' : ''}`}>
-      <span>{RANKS[card.rank] ?? card.rank}</span>
-      <span>{SUITS[card.suit]}</span>
+    <div
+      className={`playing-card ${compact ? 'compact' : ''} ${red ? 'red' : ''}`}
+      style={dealDelay ? { animationDelay: `${dealDelay}ms` } : undefined}
+    >
+      <span className="pc-rank">{RANKS[card.rank] ?? card.rank}</span>
+      <span className="pc-suit">{SUITS[card.suit]}</span>
     </div>
   )
 }
 
-function Metric({ icon, label, value }: { icon: ReactNode; label: string; value: string }) {
-  return (
-    <div className="metric">
-      {icon}
-      <span>{label}</span>
-      <strong>{value}</strong>
-    </div>
-  )
+function monogram(id: string): string {
+  return id
+    .split(/[-_\s]/)
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((part) => part[0]?.toUpperCase() ?? '')
+    .join('')
 }
 
-function describeEvent(event: TableEvent): string {
+function capitalize(word: string): string {
+  return word.charAt(0).toUpperCase() + word.slice(1)
+}
+
+const ACTION_VERBS: Record<string, (amount: number) => string> = {
+  fold: () => 'folds',
+  check: () => 'checks',
+  call: (amount) => (amount > 0 ? `calls ${usd(amount)}` : 'calls'),
+  raise: (amount) => `raises to ${usd(amount)}`,
+  allin: () => 'goes all in',
+}
+
+function describeEvent(event: TableEvent): string | null {
   const d = event.data
   switch (event.type) {
     case 'demo_started':
-      return `Match started: ${(d.players as string[]).join(' vs ')}`
+      return `New match: ${(d.players as string[]).join(' vs ')}`
     case 'player_joined':
-      return `${d.playerId} bought in for ${d.buyIn}`
+      return `${d.playerId} sits down`
     case 'hand_start':
-      return `Hand #${d.handNumber}, dealer ${d.dealerId}`
+      return `Hand #${d.handNumber} begins`
     case 'blind':
-      return `${d.playerId} posts ${d.blind} blind ${usd(Number(d.amount))}`
+      return `${d.playerId} posts ${usd(Number(d.amount))}`
     case 'deal':
-      return `${d.street}: ${((d.board as Card[]) ?? []).map(cardLabel).join(' ')}`
-    case 'action':
-      return `${d.playerId} ${d.action}${Number(d.amount) > 0 ? ` ${usd(Number(d.amount))}` : ''}`
+      return `${capitalize(String(d.street))}: ${((d.board as Card[]) ?? []).map(cardLabel).join(' ')}`
+    case 'action': {
+      const verb = ACTION_VERBS[String(d.action)]
+      return verb ? `${d.playerId} ${verb(Number(d.amount) || 0)}` : `${d.playerId} ${d.action}`
+    }
     case 'showdown':
-      return `Showdown: ${((d.hands as { playerId: string; handName: string }[]) ?? []).map((hand) => `${hand.playerId} ${hand.handName}`).join(', ')}`
+      return `Showdown — ${((d.hands as { playerId: string; handName: string }[]) ?? [])
+        .map((hand) => `${hand.playerId}: ${hand.handName}`)
+        .join(', ')}`
     case 'hand_end': {
       const result = d.result as { winners: { playerId: string; amount: number; handName?: string }[] }
-      return result.winners.map((winner) => `${winner.playerId} wins ${usd(winner.amount)}${winner.handName ? ` with ${winner.handName}` : ''}`).join(', ')
+      return result.winners
+        .map((w) => `${w.playerId} wins ${usd(w.amount)}${w.handName ? ` with ${w.handName}` : ''}`)
+        .join(', ')
     }
     case 'chat':
-      return `${d.playerId}: "${d.say}"`
+      return `${d.playerId}: “${d.say}”`
     case 'thought':
-      return `${d.playerId} thinks: ${String(d.thinking ?? '').slice(0, 160)}`
+      return `${d.playerId} is thinking it over…`
     case 'payout':
-      return `${d.playerId} cashed out ${d.amount}`
-    case 'payout_failed':
-      return `Payout failed for ${d.playerId}`
+      return `${d.playerId} cashes out ${d.amount}`
     case 'settling':
-      return 'Game over, settling on-chain'
+      return 'Match over — paying out'
     case 'settled':
-      return `Table settled after ${d.hands} hands`
-    case 'demo_finished':
-      return 'Agent workers finished'
+      return 'All chips paid out'
+    case 'bet_placed':
+      return `Someone put ${d.amount} on ${d.agentId}`
+    case 'bet_won':
+      return `A backer collected ${d.amount} on ${d.agentId}`
+    case 'bets_refunded':
+      return 'Open bets refunded'
     default:
-      return event.type
+      return null
   }
 }
 
@@ -315,13 +546,6 @@ function cardLabel(card: Card): string {
 }
 
 function usd(chips: number): string {
-  return `$${(chips / 1e6).toFixed(2)}`
-}
-
-function shortAddress(address: string): string {
-  return `${address.slice(0, 6)}…${address.slice(-4)}`
-}
-
-function shortHash(hash: string): string {
-  return `${hash.slice(0, 10)}…${hash.slice(-6)}`
+  const dollars = chips / 1e6
+  return `${dollars < 0 ? '-' : ''}$${Math.abs(dollars).toFixed(2)}`
 }

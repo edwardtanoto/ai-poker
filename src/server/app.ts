@@ -3,10 +3,11 @@ import { Hono } from 'hono'
 import { streamSSE } from 'hono/streaming'
 import { Mppx, tempo } from 'mppx/hono'
 import { isAddress } from 'viem'
-import { BUY_IN_USD, PATH_USD, SERVER_URL, TABLE_SEATS, formatUsd } from '../config.js'
+import { BUY_IN_USD, CHIP_SCALE, PATH_USD, SERVER_URL, TABLE_SEATS, formatUsd } from '../config.js'
 import { runAgent } from '../agents/index.js'
 import type { TableEvent } from './table.js'
 import { HttpError, Table } from './table.js'
+import { BettingBook } from './bets.js'
 import type { Wallet } from '../payments/wallet.js'
 
 export type TableAppContext = {
@@ -18,14 +19,31 @@ export type TableAppContext = {
 const AGENT_NAMES = ['ace-bot', 'river-rat', 'bluff-machine', 'tilt-proof'] as const
 
 export function createTableApp(treasury: Wallet): TableAppContext {
-  let table = new Table((to, baseUnits) => treasury.send(to, baseUnits))
+  // SSE fan-out lives outside the Table so connected spectators keep
+  // receiving events after reset/start swaps in a fresh Table instance.
+  const sseListeners = new Set<(e: TableEvent) => void>()
+  const newTable = (targetSeats?: number): Table => {
+    const t = new Table((to, baseUnits) => treasury.send(to, baseUnits), targetSeats)
+    t.subscribe((e) => {
+      for (const fn of sseListeners) fn(e)
+      // Settle spectator bets once the match result is final.
+      if (e.type === 'settled') void bets.resolve(t.payouts)
+    })
+    return t
+  }
+
+  let table = newTable()
   let demoRunning = false
+  const bets = new BettingBook(treasury, (type, data) => table.emitSystem(type, data))
 
   const resetTable = () => {
     if (demoRunning) throw new HttpError(409, 'A match is already running')
-    table = new Table((to, baseUnits) => treasury.send(to, baseUnits))
+    void bets.refundOpen('match reset')
+    table = newTable()
     return table
   }
+
+  const bettingOpen = () => (table.state === 'waiting' || table.state === 'playing') && table.seats.length > 0
 
   const mppx = Mppx.create({
     methods: [
@@ -67,12 +85,12 @@ export function createTableApp(treasury: Wallet): TableAppContext {
 
   app.post('/api/table/start', async (c) => {
     if (demoRunning) throw new HttpError(409, 'A match is already running')
-    if (table.state !== 'waiting' || table.seats.length > 0) {
-      table = new Table((to, baseUnits) => treasury.send(to, baseUnits))
-    }
-
     const body = await c.req.json().catch(() => ({}))
     const seatCount = Math.max(2, Math.min(Number(body.seats ?? TABLE_SEATS) || TABLE_SEATS, AGENT_NAMES.length))
+    if (table.state !== 'waiting' || table.seats.length > 0 || table.targetSeats !== seatCount) {
+      void bets.refundOpen('new match')
+      table = newTable(seatCount)
+    }
     const names = AGENT_NAMES.slice(0, seatCount)
     demoRunning = true
     table.emitSystem('demo_started', { players: names, serverUrl: SERVER_URL })
@@ -138,6 +156,47 @@ export function createTableApp(treasury: Wallet): TableAppContext {
     return c.json({ ok: true })
   })
 
+  // ---- spectator betting (server-custodial testnet wallets) ----
+
+  app.post('/api/bets/session', async (c) => {
+    const body = await c.req.json().catch(() => ({}))
+    const session = await bets.session(typeof body.spectatorId === 'string' ? body.spectatorId : undefined)
+    return c.json(session)
+  })
+
+  app.post('/api/bets/topup', async (c) => {
+    const body = await c.req.json().catch(() => ({}))
+    if (typeof body.spectatorId !== 'string') throw new HttpError(400, 'spectatorId required')
+    return c.json(await bets.topup(body.spectatorId))
+  })
+
+  app.post('/api/bets/place', async (c) => {
+    const body = await c.req.json().catch(() => ({}))
+    const { spectatorId, agentId, amount } = body as { spectatorId?: string; agentId?: string; amount?: number }
+    if (typeof spectatorId !== 'string' || typeof agentId !== 'string' || typeof amount !== 'number') {
+      throw new HttpError(400, 'spectatorId, agentId, amount required')
+    }
+    const bet = await bets.place(spectatorId, agentId, Math.round(amount * CHIP_SCALE), {
+      seatedIds: table.seats.map((s) => s.id),
+      open: bettingOpen(),
+      multiplier: table.targetSeats,
+    })
+    return c.json({ bet, balance: await bets.balance(spectatorId) })
+  })
+
+  app.get('/api/bets/state', async (c) => {
+    const spectatorId = c.req.query('spectatorId') ?? undefined
+    const { pools, myBets } = bets.state(spectatorId)
+    const balance = spectatorId ? await bets.balance(spectatorId).catch(() => null) : null
+    return c.json({
+      open: bettingOpen(),
+      multiplier: table.targetSeats,
+      pools,
+      myBets,
+      balance,
+    })
+  })
+
   app.get('/api/table/log', (c) => {
     const token = c.req.header('x-player-token')
     const seat = token ? table.seatByToken(token) : undefined
@@ -146,18 +205,25 @@ export function createTableApp(treasury: Wallet): TableAppContext {
 
   app.get('/api/table/events', (c) =>
     streamSSE(c, async (stream) => {
+      // Flush headers right away so EventSource fires onopen even when the
+      // event log is still empty (piped streams only send headers on first write).
+      await stream.write(': connected\n\n')
       for (const e of table.events) {
         await stream.writeSSE({ data: JSON.stringify(e), id: String(e.seq) })
       }
       let open = true
-      const unsubscribe = table.subscribe((e) => {
+      const listener = (e: TableEvent) => {
         void stream.writeSSE({ data: JSON.stringify(e), id: String(e.seq) })
-      })
+      }
+      sseListeners.add(listener)
       stream.onAbort(() => {
         open = false
-        unsubscribe()
+        sseListeners.delete(listener)
       })
-      while (open) await new Promise((r) => setTimeout(r, 15_000))
+      while (open) {
+        await new Promise((r) => setTimeout(r, 15_000))
+        if (open) await stream.write(': keepalive\n\n').catch(() => undefined)
+      }
     }),
   )
 
