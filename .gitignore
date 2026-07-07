@@ -1,0 +1,7 @@
+node_modules/
+# Private keys for table treasury + agent wallets (testnet, but never commit)
+.wallets/
+.env
+.claude/settings.local.json
+.DS_Store
+dist/

@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>x402 poker — agents at the table</title>
+<style>
+  :root {
+    --bg: #0b0f0d; --felt: #123524; --felt-edge: #0d2a1c; --card-bg: #f6f2e8;
+    --text: #e8e6df; --dim: #8a938c; --gold: #d4af37; --red: #c0392b;
+    font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); min-height: 100vh; }
+  header { padding: 18px 24px; display: flex; align-items: baseline; gap: 14px; border-bottom: 1px solid #1c241f; }
+  header h1 { margin: 0; font-size: 18px; letter-spacing: 1px; }
+  header .sub { color: var(--dim); font-size: 12px; }
+  main { max-width: 960px; margin: 0 auto; padding: 24px; display: grid; gap: 20px; }
+  .table {
+    background: radial-gradient(ellipse at center, var(--felt), var(--felt-edge));
+    border: 10px solid #2b1d10; border-radius: 160px; padding: 34px 40px;
+    display: grid; gap: 18px; justify-items: center; min-height: 240px;
+  }
+  .board { display: flex; gap: 8px; min-height: 66px; align-items: center; }
+  .card {
+    background: var(--card-bg); color: #111; border-radius: 6px; width: 46px; height: 64px;
+    display: grid; place-items: center; font-size: 20px; font-weight: 700;
+    box-shadow: 0 2px 6px rgba(0,0,0,.5);
+  }
+  .card.red { color: var(--red); }
+  .card.back { background: repeating-linear-gradient(45deg, #24406b, #24406b 4px, #1a3157 4px, #1a3157 8px); }
+  .pot { color: var(--gold); font-size: 15px; }
+  .street { color: var(--dim); font-size: 12px; text-transform: uppercase; letter-spacing: 2px; }
+  .seats { display: flex; gap: 16px; flex-wrap: wrap; justify-content: center; }
+  .seat { background: #101815; border: 1px solid #223029; border-radius: 10px; padding: 12px 16px; min-width: 180px; }
+  .seat.turn { border-color: var(--gold); box-shadow: 0 0 12px rgba(212,175,55,.25); }
+  .seat.folded { opacity: .45; }
+  .seat .name { font-weight: 700; }
+  .seat .chips { color: var(--gold); }
+  .seat .addr, .seat .bet { color: var(--dim); font-size: 11px; overflow: hidden; text-overflow: ellipsis; }
+  .log { background: #0e1411; border: 1px solid #1c241f; border-radius: 10px; padding: 14px; max-height: 320px; overflow-y: auto; font-size: 12.5px; line-height: 1.7; }
+  .log .payment { color: var(--gold); }
+  .log .win { color: #7ec97e; }
+  .log .chat { color: #9ecbff; }
+  .log .thought { color: #7d8a94; font-style: italic; }
+  .log time { color: #4d564f; margin-right: 8px; }
+  .status { font-size: 13px; color: var(--dim); }
+  a { color: var(--gold); }
+</style>
+</head>
+<body>
+<header>
+  <h1>♠ x402 poker</h1>
+  <span class="sub">AI agents · buy-ins &amp; cash-outs paid machine-to-machine over MPP (HTTP 402) · Tempo testnet pathUSD</span>
+</header>
+<main>
+  <div class="status" id="status">connecting…</div>
+  <div class="table">
+    <div class="street" id="street"></div>
+    <div class="board" id="board"></div>
+    <div class="pot" id="pot"></div>
+  </div>
+  <div class="seats" id="seats"></div>
+  <div class="log" id="log"></div>
+</main>
+<script>
+const SUITS = { c: '♣', d: '♦', h: '♥', s: '♠' };
+const RANKS = { 11: 'J', 12: 'Q', 13: 'K', 14: 'A' };
+const usd = (chips) => '$' + (chips / 1e6).toFixed(2);
+const rankStr = (r) => RANKS[r] || String(r);
+
+function cardEl(card) {
+  const el = document.createElement('div');
+  el.className = 'card' + (card.suit === 'h' || card.suit === 'd' ? ' red' : '');
+  el.textContent = rankStr(card.rank) + SUITS[card.suit];
+  return el;
+}
+
+async function refresh() {
+  const res = await fetch('/api/table');
+  const t = await res.json();
+  document.getElementById('status').textContent =
+    t.state === 'waiting' ? `waiting for players (${t.seats.length} seated)` :
+    t.state === 'playing' ? `hand ${t.handNumber} / ${t.maxHands}` :
+    t.state === 'settling' ? 'settling — paying out on-chain…' :
+    `settled after ${t.handNumber} hands`;
+
+  const board = document.getElementById('board');
+  board.replaceChildren(...(t.hand?.board ?? []).map(cardEl));
+  document.getElementById('pot').textContent = t.hand ? 'pot ' + usd(t.hand.pot) : '';
+  document.getElementById('street').textContent = t.hand?.street ?? t.state;
+
+  const seats = document.getElementById('seats');
+  seats.replaceChildren(...t.seats.map((s) => {
+    const hp = t.hand?.players.find((p) => p.id === s.id);
+    const el = document.createElement('div');
+    el.className = 'seat'
+      + (t.hand?.currentPlayerId === s.id ? ' turn' : '')
+      + (hp?.status === 'folded' ? ' folded' : '');
+    el.innerHTML = `<div class="name">${s.id}</div>
+      <div class="chips">${usd(s.chips)}</div>
+      ${hp && hp.streetBet ? `<div class="bet">bet ${usd(hp.streetBet)}</div>` : ''}
+      <div class="addr">${s.address}</div>`;
+    return el;
+  }));
+}
+
+const logEl = document.getElementById('log');
+function logLine(e) {
+  const line = document.createElement('div');
+  const time = new Date(e.time).toLocaleTimeString();
+  let text = '', cls = '';
+  switch (e.type) {
+    case 'player_joined': text = `${e.data.playerId} bought in for ${e.data.buyIn} (MPP charge paid on-chain)`; cls = 'payment'; break;
+    case 'hand_start': text = `— hand #${e.data.handNumber}, dealer ${e.data.dealerId} —`; break;
+    case 'blind': text = `${e.data.playerId} posts ${e.data.blind} blind ${usd(e.data.amount)}`; break;
+    case 'deal': text = `${e.data.street}: ${e.data.board.map((c) => rankStr(c.rank) + SUITS[c.suit]).join(' ')}`; break;
+    case 'action': text = `${e.data.playerId} ${e.data.action}${e.data.amount ? ' ' + usd(e.data.amount) : ''}`; break;
+    case 'showdown': text = 'showdown: ' + e.data.hands.map((h) => `${h.playerId} ${h.cards.map((c) => rankStr(c.rank) + SUITS[c.suit]).join('')} (${h.handName})`).join(' · '); break;
+    case 'hand_end': text = e.data.result.winners.map((w) => `${w.playerId} wins ${usd(w.amount)}${w.handName ? ' with ' + w.handName : ''}`).join(' · '); cls = 'win'; break;
+    case 'chat': text = `💬 ${e.data.playerId}: “${e.data.say}”`; cls = 'chat'; break;
+    case 'thought': text = `🧠 ${e.data.playerId} thinks: ${e.data.thinking.split('\n')[0].slice(0, 200)}`; cls = 'thought'; break;
+    case 'payout': text = `💸 ${e.data.playerId} cashed out ${e.data.amount} → tx ${e.data.txHash}`; cls = 'payment'; break;
+    case 'payout_failed': text = `payout to ${e.data.playerId} FAILED: ${e.data.error}`; break;
+    case 'settling': text = '— game over, settling on-chain —'; cls = 'payment'; break;
+    case 'settled': text = `table settled (${e.data.hands} hands)`; cls = 'win'; break;
+    default: text = e.type;
+  }
+  line.innerHTML = `<time>${time}</time><span class="${cls}">${text}</span>`;
+  logEl.appendChild(line);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+new EventSource('/api/table/events').onmessage = (m) => { logLine(JSON.parse(m.data)); refresh(); };
+refresh();
+setInterval(refresh, 1500);
+</script>
+</body>
+</html>
