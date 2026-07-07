@@ -88,38 +88,27 @@ function handStrength(hole: Card[], board: Card[]): number {
   return playsTheBoard ? base * 0.4 : 0.25 + base * 0.75
 }
 
-const MODEL = process.env.POKER_MODEL ?? 'claude-opus-4-8'
-const EFFORT = (process.env.POKER_EFFORT ?? 'low') as 'low' | 'medium' | 'high'
+type Provider = 'anthropic' | 'openai' | 'google'
+
+const PROVIDER = process.env.POKER_PROVIDER as Provider | undefined
 
 /**
- * Haiku 4.5 (and Sonnet 4.5) don't support adaptive thinking or the effort
- * parameter — they use the legacy `budget_tokens` form. Everything 4.6+
- * gets adaptive thinking with a summarized display for the spectator feed.
+ * Provider-agnostic LLM brain. AI SDK handles structured outputs across model
+ * vendors, while the poker engine still receives one tiny legal action object.
  */
-function modelParams(): { thinking: object; effort?: string } {
-  if (/haiku|sonnet-4-5/.test(MODEL)) {
-    return { thinking: { type: 'enabled', budget_tokens: 3000 } }
-  }
-  return { thinking: { type: 'adaptive', display: 'summarized' }, effort: EFFORT }
-}
-
-/**
- * Claude-powered brain: a persona-driven LLM player with adaptive thinking.
- * Decisions come back as structured JSON; the thinking summary is surfaced
- * to spectators and the `say` field is broadcast as table talk.
- */
-export function claudeBrain(playerId: string): Brain {
+export function aiSdkBrain(playerId: string): Brain {
   const persona = personaFor(playerId)
+  const provider = resolveProvider()
+  const modelId = process.env.POKER_MODEL ?? defaultModel(provider)
 
   return {
-    name: `claude(${MODEL}, ${persona.id})`,
+    name: `${provider}(${modelId}, ${persona.id})`,
     decide: async (input) => {
-      const [{ default: Anthropic }, { z }, { zodOutputFormat }] = await Promise.all([
-        import('@anthropic-ai/sdk'),
+      const [{ generateObject }, { z }] = await Promise.all([
+        import('ai'),
         import('zod'),
-        import('@anthropic-ai/sdk/helpers/zod'),
       ])
-      const client = new Anthropic()
+      const model = await createModel(provider, modelId)
 
       const DecisionSchema = z.object({
         action: z.enum(['fold', 'check', 'call', 'raise', 'allin']),
@@ -131,77 +120,97 @@ export function claudeBrain(playerId: string): Brain {
           .string()
           .nullable()
           .describe('Optional short table talk said out loud to opponents (max ~120 chars). Stay in character. null to stay silent.'),
+        thinking: z
+          .string()
+          .nullable()
+          .describe('Spectator-safe strategic summary in 1-2 sentences. Do not include hidden chain-of-thought.'),
       })
 
-      const system = [
-        persona.style,
-        '',
-        "You are playing no-limit Texas Hold'em against other AI agents for real stablecoin stakes on-chain.",
-        'Winning chips means winning real money at cash-out. Play to win the whole table.',
-        'Core skills you must use: pot odds, position, hand reading from betting lines,',
-        'bluffing with credible stories, value betting, and adjusting to each opponent',
-        'based on the game history you are shown. Deception is part of the game —',
-        'your table talk may lie, but your action must be strategically sound.',
-        'Never truthfully reveal your exact hole cards in table talk while a hand',
-        'is live — talk is a weapon, not a confession. Opponents read and exploit it.',
-      ].join('\n')
-
-      const { legal } = input
-      const options: string[] = []
-      if (legal.canFold) options.push('fold')
-      if (legal.canCheck) options.push('check')
-      if (legal.canCall) options.push(`call for ${formatUsd(legal.callAmount)}`)
-      if (legal.canRaise) options.push(`raise to between ${formatUsd(legal.minRaiseTo)} and ${formatUsd(legal.maxRaiseTo)} (street total; max = all-in)`)
-
-      const potOdds = legal.callAmount > 0
-        ? `Pot odds: calling ${formatUsd(legal.callAmount)} to win ${formatUsd(input.pot + legal.callAmount)} → need ${((legal.callAmount / (input.pot + legal.callAmount)) * 100).toFixed(0)}% equity.`
-        : ''
-
-      const historyBlock = input.history.length
-        ? `Game history (your memory — use it to model opponents):\n${input.history.slice(-60).join('\n')}`
-        : 'No history yet — first hand.'
-
-      const prompt = [
-        `Hand #${input.handNumber} of ${input.maxHands} · street: ${input.street}`,
-        `Your hole cards (SECRET): ${cardsToString(input.holeCards)}`,
-        `Board: ${input.board.length ? cardsToString(input.board) : 'none yet'}`,
-        `Pot: ${formatUsd(input.pot)} · Your stack: ${formatUsd(input.stack)}`,
-        `Opponents: ${input.opponents.map((o) => `${o.id} (stack ${formatUsd(o.stack)}, ${o.status}, street bet ${formatUsd(o.streetBet)})`).join('; ')}`,
-        potOdds,
-        '',
-        historyBlock,
-        '',
-        `Your legal options: ${options.join(' | ')}`,
-        'Decide your action.',
-      ].filter(Boolean).join('\n')
-
-      const params = modelParams()
-      const response = await client.messages.parse({
-        model: MODEL,
-        max_tokens: 16000,
-        thinking: params.thinking as never,
-        output_config: {
-          ...(params.effort ? { effort: params.effort as 'low' } : {}),
-          format: zodOutputFormat(DecisionSchema),
-        },
-        system,
-        messages: [{ role: 'user', content: prompt }],
+      const { object } = await generateObject({
+        model,
+        schema: DecisionSchema,
+        system: buildSystemPrompt(persona.style),
+        prompt: buildDecisionPrompt(input),
       })
 
-      const thinking = response.content
-        .filter((b) => b.type === 'thinking')
-        .map((b) => b.thinking)
-        .join('\n')
-        .trim() || undefined
-
-      const parsed = response.parsed_output
-      if (!parsed) throw new Error(`No structured decision (stop_reason: ${response.stop_reason})`)
-
-      const say = parsed.say?.slice(0, 160) || undefined
-      const decision = toLegalDecision(parsed, legal)
+      const say = object.say?.slice(0, 160) || undefined
+      const thinking = object.thinking?.slice(0, 600) || undefined
+      const decision = toLegalDecision(object, input.legal)
       return { decision, say, thinking }
     },
   }
+}
+
+async function createModel(provider: Provider, modelId: string) {
+  if (provider === 'anthropic') {
+    const { anthropic } = await import('@ai-sdk/anthropic')
+    return anthropic(modelId)
+  }
+  if (provider === 'openai') {
+    const { openai } = await import('@ai-sdk/openai')
+    return openai(modelId)
+  }
+  const { google } = await import('@ai-sdk/google')
+  return google(modelId)
+}
+
+function resolveProvider(): Provider {
+  if (PROVIDER) return PROVIDER
+  if (process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN) return 'anthropic'
+  if (process.env.OPENAI_API_KEY) return 'openai'
+  if (process.env.GOOGLE_GENERATIVE_AI_API_KEY || process.env.GOOGLE_API_KEY) return 'google'
+  return 'anthropic'
+}
+
+function defaultModel(provider: Provider): string {
+  if (provider === 'openai') return 'gpt-5-mini'
+  if (provider === 'google') return 'gemini-2.5-flash'
+  return 'claude-opus-4-8'
+}
+
+function buildSystemPrompt(style: string): string {
+  return [
+    style,
+    '',
+    "You are playing no-limit Texas Hold'em against other AI agents for real stablecoin stakes on-chain.",
+    'Winning chips means winning real money at cash-out. Play to win the whole table.',
+    'Use pot odds, position, hand reading from betting lines, bluffing with credible stories,',
+    'value betting, and opponent adjustments from the public game history.',
+    'You may lie in public table talk, but your action must be strategically sound.',
+    'Never truthfully reveal your exact hole cards in table talk while a hand is live.',
+    'Return only the structured object requested by the schema.',
+  ].join('\n')
+}
+
+function buildDecisionPrompt(input: BrainInput): string {
+  const { legal } = input
+  const options: string[] = []
+  if (legal.canFold) options.push('fold')
+  if (legal.canCheck) options.push('check')
+  if (legal.canCall) options.push(`call for ${formatUsd(legal.callAmount)}`)
+  if (legal.canRaise) options.push(`raise to between ${formatUsd(legal.minRaiseTo)} and ${formatUsd(legal.maxRaiseTo)} (street total; max = all-in)`)
+
+  const potOdds = legal.callAmount > 0
+    ? `Pot odds: calling ${formatUsd(legal.callAmount)} to win ${formatUsd(input.pot + legal.callAmount)} -> need ${((legal.callAmount / (input.pot + legal.callAmount)) * 100).toFixed(0)}% equity.`
+    : ''
+
+  const historyBlock = input.history.length
+    ? `Game history (your memory; use it to model opponents):\n${input.history.slice(-60).join('\n')}`
+    : 'No history yet.'
+
+  return [
+    `Hand #${input.handNumber} of ${input.maxHands} | street: ${input.street}`,
+    `Your hole cards (SECRET): ${cardsToString(input.holeCards)}`,
+    `Board: ${input.board.length ? cardsToString(input.board) : 'none yet'}`,
+    `Pot: ${formatUsd(input.pot)} | Your stack: ${formatUsd(input.stack)}`,
+    `Opponents: ${input.opponents.map((o) => `${o.id} (stack ${formatUsd(o.stack)}, ${o.status}, street bet ${formatUsd(o.streetBet)})`).join('; ')}`,
+    potOdds,
+    '',
+    historyBlock,
+    '',
+    `Your legal options: ${options.join(' | ')}`,
+    'Decide your action, optional table talk, and a spectator-safe strategic summary.',
+  ].filter(Boolean).join('\n')
 }
 
 /** Clamps the model's intent to a legal action so an off-by-one never crashes the turn. */
@@ -226,7 +235,16 @@ function toLegalDecision(
 }
 
 export function pickBrain(playerId: string): Brain {
-  if (process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN) return claudeBrain(playerId)
-  console.log(`[${playerId}] no ANTHROPIC_API_KEY — using rule-based fallback brain`)
+  if (
+    PROVIDER ||
+    process.env.ANTHROPIC_API_KEY ||
+    process.env.ANTHROPIC_AUTH_TOKEN ||
+    process.env.OPENAI_API_KEY ||
+    process.env.GOOGLE_GENERATIVE_AI_API_KEY ||
+    process.env.GOOGLE_API_KEY
+  ) {
+    return aiSdkBrain(playerId)
+  }
+  console.log(`[${playerId}] no LLM provider API key — using rule-based fallback brain`)
   return ruleBrain()
 }

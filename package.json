@@ -18,8 +18,12 @@
   "license": "ISC",
   "type": "module",
   "dependencies": {
+    "@ai-sdk/anthropic": "^4.0.8",
+    "@ai-sdk/google": "^4.0.8",
+    "@ai-sdk/openai": "^4.0.8",
     "@anthropic-ai/sdk": "^0.110.0",
     "@hono/node-server": "^2.0.8",
+    "ai": "^7.0.16",
     "hono": "^4.12.28",
     "lucide-react": "^1.23.0",
     "mppx": "^0.8.6",
