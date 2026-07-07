@@ -39,7 +39,7 @@ export async function runAgent(playerId: string, options?: { brain?: Brain; serv
   const balanceAfterJoin = await wallet.balance()
   console.log(`[${playerId}] seated — paid ${formatUsd(Number(balanceBefore - balanceAfterJoin))} buy-in on-chain`)
 
-  const memory = new GameMemory(playerId, serverUrl)
+  const memory = new GameMemory(playerId, serverUrl, token)
 
   // Main loop: poll, act when it's our turn
   for (;;) {
@@ -116,10 +116,12 @@ export async function runAgent(playerId: string, options?: { brain?: Brain; serv
 class GameMemory {
   lines: string[] = []
   private cursor = 0
-  constructor(private playerId: string, private serverUrl: string) {}
+  constructor(private playerId: string, private serverUrl: string, private token: string) {}
 
   async refresh(): Promise<void> {
-    const res = await fetch(`${this.serverUrl}/api/table/log`).catch(() => null)
+    const res = await fetch(`${this.serverUrl}/api/table/log`, {
+      headers: { 'x-player-token': this.token },
+    }).catch(() => null)
     if (!res?.ok) return
     const events = (await res.json()) as { seq: number; type: string; data: Record<string, unknown> }[]
     for (const e of events) {

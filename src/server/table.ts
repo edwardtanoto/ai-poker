@@ -49,6 +49,10 @@ export class Table {
     return () => this.listeners.delete(fn)
   }
 
+  emitSystem(type: string, data: Record<string, unknown>): void {
+    this.emit(type, data)
+  }
+
   private emit(type: string, data: Record<string, unknown>): void {
     const event: TableEvent = { seq: ++this.seq, time: Date.now(), type, data }
     this.events.push(event)
@@ -96,9 +100,10 @@ export class Table {
     if (this.hand.isComplete) this.finishHand()
   }
 
-  /** Public view; pass a seat to include that player's private cards + options. */
+  /** Spectators see the whole table; pass a seat for the private agent API view. */
   view(seat?: Seat) {
     const hand = this.hand
+    const agentView = Boolean(seat)
     return {
       state: this.state,
       handNumber: this.handNumber,
@@ -118,7 +123,11 @@ export class Table {
             pot: hand.pot,
             currentPlayerId: hand.currentPlayerId,
             players: hand.players.map((p) => ({
-              id: p.id, status: p.status, streetBet: p.streetBet, stack: p.stack,
+              id: p.id,
+              status: p.status,
+              streetBet: p.streetBet,
+              stack: p.stack,
+              holeCards: agentView ? [] : p.holeCards,
             })),
           }
         : null,
