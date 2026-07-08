@@ -2,8 +2,12 @@ import http, { type IncomingMessage, type ServerResponse } from 'node:http'
 import { Readable } from 'node:stream'
 import next from 'next'
 import { SERVER_PORT } from './src/config.js'
-import { openWallet } from './src/payments/wallet.js'
+import { openWallet, withAutoRefill } from './src/payments/wallet.js'
 import { createTableApp } from './src/server/app.js'
+
+// Refill the treasury from the testnet faucet before it can no longer cover
+// a max bet payout ($100 stake × 4 seats) or a spectator top-up.
+const TREASURY_MIN = 2000n * 10n ** 6n
 
 const dev = process.env.NODE_ENV !== 'production'
 const hostname = '0.0.0.0'
@@ -12,7 +16,7 @@ const port = SERVER_PORT
 const nextApp = next({ dev, hostname, port })
 const nextHandler = nextApp.getRequestHandler()
 
-const treasury = await openWallet('treasury', '.wallets/treasury.json')
+const treasury = withAutoRefill(await openWallet('treasury', '.wallets/treasury.json'), 'treasury', TREASURY_MIN)
 console.log(`[server] treasury: ${treasury.address}`)
 const hasLlmKey = Boolean(
   process.env.POKER_PROVIDER ||

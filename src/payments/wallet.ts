@@ -76,8 +76,31 @@ export async function openWallet(
   return wallet
 }
 
-async function ensureFunded(wallet: Wallet, name: string): Promise<void> {
-  const min = 100n * 10n ** BigInt(DECIMALS) // keep at least 100 pathUSD around
+/**
+ * Wraps a wallet so every send first tops the balance back up from the
+ * testnet faucet when it dips below `minBaseUnits`. Keeps a long-running
+ * treasury solvent through spectator top-ups and bet payouts. Testnet only —
+ * there is no faucet to lean on with real funds.
+ */
+export function withAutoRefill(wallet: Wallet, name: string, minBaseUnits: bigint): Wallet {
+  let refilling: Promise<void> | null = null
+  return {
+    ...wallet,
+    send: async (to, baseUnits) => {
+      refilling ??= ensureFunded(wallet, name, minBaseUnits).finally(() => {
+        refilling = null
+      })
+      await refilling.catch((error) => {
+        // A dry faucet shouldn't block sends while the balance still covers them.
+        console.error(`[wallet:${name}] faucet refill failed`, error)
+      })
+      return wallet.send(to, baseUnits)
+    },
+  }
+}
+
+async function ensureFunded(wallet: Wallet, name: string, min?: bigint): Promise<void> {
+  min ??= 100n * 10n ** BigInt(DECIMALS) // keep at least 100 pathUSD around
   const balance = await wallet.balance().catch(() => 0n)
   if (balance >= min) return
   console.log(`[wallet:${name}] balance low (${balance}), requesting faucet funds…`)
