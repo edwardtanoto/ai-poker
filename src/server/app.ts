@@ -184,6 +184,56 @@ export function createTableApp(treasury: Wallet): TableAppContext {
     return c.json({ bet, balance: await bets.balance(spectatorId) })
   })
 
+  app.post('/api/bets/withdraw', async (c) => {
+    const body = await c.req.json().catch(() => ({}))
+    const { spectatorId, address } = body as { spectatorId?: string; address?: string }
+    if (typeof spectatorId !== 'string' || typeof address !== 'string') {
+      throw new HttpError(400, 'spectatorId and address required')
+    }
+    return c.json(await bets.withdraw(spectatorId, address))
+  })
+
+  // Bet with your own wallet over MPP: any x402-capable client pays the 402
+  // (stake settles to the treasury) and names where winnings should go.
+  // Middleware amounts are fixed per route, so bets come in tiers. The bet is
+  // validated BEFORE the charge so a doomed bet is rejected while it is still
+  // free; the rare post-payment race refunds the stake.
+  const betContext = () => ({
+    seatedIds: table.seats.map((s) => s.id),
+    open: bettingOpen(),
+    multiplier: table.targetSeats,
+  })
+  for (const tier of [1, 5, 20] as const) {
+    app.post(
+      `/api/bets/place-mpp/${tier}`,
+      async (c, next) => {
+        const body = await c.req.json().catch(() => ({}))
+        const { agentId, payoutAddress } = body as { agentId?: string; payoutAddress?: string }
+        if (typeof agentId !== 'string' || typeof payoutAddress !== 'string' || !isAddress(payoutAddress)) {
+          throw new HttpError(400, 'agentId and payoutAddress (where winnings go) required')
+        }
+        const ctx = betContext()
+        if (!ctx.open) throw new HttpError(409, 'Betting is closed for this match')
+        if (!ctx.seatedIds.includes(agentId)) throw new HttpError(400, 'Unknown player')
+        await next()
+      },
+      mppx.charge({ amount: String(tier), description: `x402-poker spectator bet ($${tier})` }),
+      async (c) => {
+        const body = (await c.req.json()) as { agentId: string; payoutAddress: string }
+        try {
+          const bet = bets.placeExternal(body.agentId, tier * CHIP_SCALE, body.payoutAddress, lastReceipt, betContext())
+          return c.json({ bet })
+        } catch (error) {
+          // The 402 already settled; return the stake before failing.
+          await treasury.send(body.payoutAddress as `0x${string}`, BigInt(tier * CHIP_SCALE)).catch(console.error)
+          throw error instanceof HttpError
+            ? new HttpError(error.status, `${error.message} — stake refunded`)
+            : error
+        }
+      },
+    )
+  }
+
   app.get('/api/bets/state', async (c) => {
     const spectatorId = c.req.query('spectatorId') ?? undefined
     const { pools, myBets } = bets.state(spectatorId)

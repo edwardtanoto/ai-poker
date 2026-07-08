@@ -78,6 +78,11 @@ export function SpectatorTable() {
   const [betAmount, setBetAmount] = useState(5)
   const [walletBusy, setWalletBusy] = useState(false)
   const [myBetIds, setMyBetIds] = useState<string[]>([])
+  const [walletMode, setWalletMode] = useState<'house' | 'own'>('house')
+  const [walletOpen, setWalletOpen] = useState(false)
+  const [payoutAddr, setPayoutAddr] = useState('')
+  const [depositAddr, setDepositAddr] = useState<string | null>(null)
+  const [walletNote, setWalletNote] = useState<string | null>(null)
 
   const fetchSeq = useRef(0)
   const betFetchSeq = useRef(0)
@@ -104,6 +109,9 @@ export function SpectatorTable() {
 
   // Spectator session: server-custodial testnet wallet keyed by a local id.
   useEffect(() => {
+    const storedMode = localStorage.getItem('pokerWalletMode')
+    if (storedMode === 'own') setWalletMode('own')
+    setPayoutAddr(localStorage.getItem('pokerPayoutAddress') ?? '')
     const stored = localStorage.getItem('pokerSpectatorId') ?? undefined
     void fetch('/api/bets/session', {
       method: 'POST',
@@ -111,10 +119,11 @@ export function SpectatorTable() {
       body: JSON.stringify({ spectatorId: stored }),
     })
       .then((res) => res.json())
-      .then((session: { spectatorId: string; balance: number }) => {
+      .then((session: { spectatorId: string; address: string; balance: number }) => {
         localStorage.setItem('pokerSpectatorId', session.spectatorId)
         spectatorRef.current = session.spectatorId
         setSpectatorId(session.spectatorId)
+        setDepositAddr(session.address)
         void refreshBets()
       })
       .catch(() => setError('Could not open your wallet session.'))
@@ -257,7 +266,44 @@ export function SpectatorTable() {
     }
   }
 
-  const needsTopup = balance !== null && balance < betAmount * 1e6
+  const needsTopup = balance !== null && balance < betAmount * 1e6 && walletMode === 'house'
+  const validPayout = /^0x[a-fA-F0-9]{40}$/.test(payoutAddr)
+
+  const pickWalletMode = (mode: 'house' | 'own') => {
+    setWalletMode(mode)
+    localStorage.setItem('pokerWalletMode', mode)
+    setWalletNote(null)
+  }
+
+  const savePayoutAddr = (value: string) => {
+    setPayoutAddr(value)
+    localStorage.setItem('pokerPayoutAddress', value)
+  }
+
+  const withdraw = async () => {
+    if (!spectatorId || !validPayout) return
+    setWalletBusy(true)
+    setWalletNote(null)
+    try {
+      const res = await fetch('/api/bets/withdraw', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ spectatorId, address: payoutAddr }),
+      })
+      const data = (await res.json().catch(() => ({}))) as { txHash?: string; balance?: number; error?: string }
+      if (!res.ok) throw new Error(data.error ?? 'Withdraw failed')
+      betFetchSeq.current++
+      if (typeof data.balance === 'number') {
+        setBetState((prev) => (prev ? { ...prev, balance: data.balance! } : prev))
+      }
+      setWalletNote(`Sent to your wallet · ${data.txHash?.slice(0, 10)}…`)
+      await refreshBets()
+    } catch (err) {
+      setWalletNote(err instanceof Error ? err.message : String(err))
+    } finally {
+      setWalletBusy(false)
+    }
+  }
 
   return (
     <div className="arena">
@@ -271,12 +317,82 @@ export function SpectatorTable() {
           </div>
         ) : null}
         <div className="wallet-area">
-          <span className="balance" title="Your testnet balance">
+          <button type="button" className="balance" title="Wallet" onClick={() => setWalletOpen((v) => !v)}>
             {balance === null ? '—' : usd(balance)}
-          </span>
-          <button type="button" className="ghost-btn" onClick={topup} disabled={walletBusy || !spectatorId}>
-            {walletBusy ? 'Adding…' : '+$100'}
           </button>
+          {walletMode === 'house' ? (
+            <button type="button" className="ghost-btn" onClick={topup} disabled={walletBusy || !spectatorId}>
+              {walletBusy ? 'Adding…' : '+$100'}
+            </button>
+          ) : (
+            <button type="button" className="ghost-btn" onClick={() => setWalletOpen((v) => !v)}>
+              Wallet
+            </button>
+          )}
+          {walletOpen ? (
+            <div className="wallet-panel">
+              <div className="mode-row" role="group" aria-label="Wallet mode">
+                <button
+                  type="button"
+                  className={walletMode === 'house' ? 'selected' : ''}
+                  onClick={() => pickWalletMode('house')}
+                >
+                  House money
+                </button>
+                <button
+                  type="button"
+                  className={walletMode === 'own' ? 'selected' : ''}
+                  onClick={() => pickWalletMode('own')}
+                >
+                  My wallet
+                </button>
+              </div>
+              {walletMode === 'house' ? (
+                <>
+                  <p className="panel-copy">Free testnet chips — no real money. Top up whenever you run low.</p>
+                  <button type="button" className="cta small" onClick={topup} disabled={walletBusy || !spectatorId}>
+                    {walletBusy ? 'Adding…' : '+$100 free chips'}
+                  </button>
+                </>
+              ) : (
+                <>
+                  <label className="panel-label" htmlFor="payout-addr">
+                    Your wallet address — winnings withdraw here
+                  </label>
+                  <input
+                    id="payout-addr"
+                    className="panel-input"
+                    placeholder="0x…"
+                    value={payoutAddr}
+                    onChange={(e) => savePayoutAddr(e.target.value)}
+                    spellCheck={false}
+                  />
+                  <span className="panel-label">Deposit — send pathUSD (Tempo testnet) to your table address</span>
+                  <code
+                    className="panel-address"
+                    title="Click to copy"
+                    onClick={() => {
+                      if (depositAddr) {
+                        void navigator.clipboard.writeText(depositAddr)
+                        setWalletNote('Address copied')
+                      }
+                    }}
+                  >
+                    {depositAddr ?? '…'}
+                  </code>
+                  <button
+                    type="button"
+                    className="cta small"
+                    onClick={withdraw}
+                    disabled={walletBusy || !validPayout || !balance}
+                  >
+                    {walletBusy ? 'Sending…' : 'Withdraw to my wallet'}
+                  </button>
+                </>
+              )}
+              {walletNote ? <p className="panel-note">{walletNote}</p> : null}
+            </div>
+          ) : null}
         </div>
       </header>
 
