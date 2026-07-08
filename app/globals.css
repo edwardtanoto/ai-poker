@@ -207,15 +207,22 @@ p {
 }
 
 .pot-note {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 8px 20px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: rgba(0, 0, 0, 0.38);
   color: rgba(255, 255, 255, 0.6);
   font-size: 13px;
 }
 
 .pot-note strong {
   color: #fff;
+  font-size: 19px;
   font-weight: 600;
   font-variant-numeric: tabular-nums;
-  margin-left: 4px;
 }
 
 /* start / result blocks on the felt */
@@ -511,12 +518,12 @@ p {
   font-variant-numeric: tabular-nums;
 }
 
+/* Speech bubbles sit BESIDE their pod so they never cover the board/pot. */
 .bubble {
   position: absolute;
-  bottom: calc(100% + 10px);
-  left: 50%;
-  transform: translateX(-50%);
-  max-width: 230px;
+  top: 4px;
+  left: calc(100% + 10px);
+  max-width: 220px;
   width: max-content;
   padding: 8px 12px;
   border-radius: 12px;
@@ -529,11 +536,10 @@ p {
   z-index: 5;
 }
 
-.pos-top .bubble,
-.pos-top-left .bubble,
+.pos-right .bubble,
 .pos-top-right .bubble {
-  bottom: auto;
-  top: calc(100% + 10px);
+  left: auto;
+  right: calc(100% + 10px);
 }
 
 /* ---------- bet bar ---------- */
@@ -780,15 +786,8 @@ p {
 
   .bubble {
     position: static;
-    transform: none;
     max-width: none;
     width: auto;
     order: 3;
-  }
-
-  .pos-top .bubble,
-  .pos-top-left .bubble,
-  .pos-top-right .bubble {
-    top: auto;
   }
 }

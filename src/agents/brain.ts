@@ -119,7 +119,7 @@ export function aiSdkBrain(playerId: string): Brain {
         say: z
           .string()
           .nullable()
-          .describe('Optional short table talk said out loud to opponents (max ~120 chars). Stay in character. null to stay silent.'),
+          .describe('Optional short table talk said out loud to opponents (max ~120 chars). Stay in character. Banter, needling, or bluffs only — NEVER your real cards, draws, outs, or pot-odds math. null to stay silent.'),
         thinking: z
           .string()
           .nullable()
@@ -177,7 +177,9 @@ function buildSystemPrompt(style: string): string {
     'Use pot odds, position, hand reading from betting lines, bluffing with credible stories,',
     'value betting, and opponent adjustments from the public game history.',
     'You may lie in public table talk, but your action must be strategically sound.',
-    'Never truthfully reveal your exact hole cards in table talk while a hand is live.',
+    'Table talk is heard by your opponents and must never reveal your true holdings:',
+    'no real hole cards, made hands, draws, outs, equity, or pot-odds reasoning.',
+    'Say things to mislead, needle, or entertain — keep every honest read in `thinking` instead.',
     'Return only the structured object requested by the schema.',
   ].join('\n')
 }

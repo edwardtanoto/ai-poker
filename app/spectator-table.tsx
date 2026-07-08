@@ -80,6 +80,7 @@ export function SpectatorTable() {
   const [myBetIds, setMyBetIds] = useState<string[]>([])
 
   const fetchSeq = useRef(0)
+  const betFetchSeq = useRef(0)
   const spectatorRef = useRef<string | null>(null)
 
   const refresh = useCallback(async () => {
@@ -90,10 +91,15 @@ export function SpectatorTable() {
     if (seq === fetchSeq.current) setTable(next)
   }, [])
 
+  // Same stale-response guard as refresh(): SSE bursts fire many of these and
+  // the balance is an on-chain read — a slow old response must not win.
   const refreshBets = useCallback(async () => {
     const id = spectatorRef.current
+    const seq = ++betFetchSeq.current
     const res = await fetch(`/api/bets/state${id ? `?spectatorId=${id}` : ''}`, { cache: 'no-store' })
-    if (res.ok) setBetState(await res.json())
+    if (!res.ok) return
+    const next = (await res.json()) as BetState
+    if (seq === betFetchSeq.current) setBetState(next)
   }, [])
 
   // Spectator session: server-custodial testnet wallet keyed by a local id.
@@ -210,7 +216,14 @@ export function SpectatorTable() {
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ spectatorId }),
       })
-      if (!res.ok) throw new Error((await res.json().catch(() => ({})) as { error?: string }).error ?? 'Top up failed')
+      const data = (await res.json().catch(() => ({}))) as { balance?: number; error?: string }
+      if (!res.ok) throw new Error(data.error ?? 'Top up failed')
+      // The mutation response carries the authoritative balance; invalidate
+      // in-flight state fetches so they can't overwrite it with a stale read.
+      betFetchSeq.current++
+      if (typeof data.balance === 'number') {
+        setBetState((prev) => (prev ? { ...prev, balance: data.balance! } : prev))
+      }
       await refreshBets()
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
@@ -229,9 +242,13 @@ export function SpectatorTable() {
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ spectatorId, agentId: pickedAgent, amount: betAmount }),
       })
-      const data = (await res.json()) as { bet?: SpectatorBet; error?: string }
+      const data = (await res.json()) as { bet?: SpectatorBet; balance?: number; error?: string }
       if (!res.ok || !data.bet) throw new Error(data.error ?? 'Bet failed')
       setMyBetIds((prev) => [...prev, data.bet!.id])
+      betFetchSeq.current++
+      if (typeof data.balance === 'number') {
+        setBetState((prev) => (prev ? { ...prev, balance: data.balance! } : prev))
+      }
       await refreshBets()
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
