@@ -81,6 +81,25 @@ export function createTableApp(treasury: Wallet): TableAppContext {
   }
 
   const matchLocked = (room: Room): boolean => room.demoRunning || room.table.state === 'playing'
+
+  // Guarantee a waiting table always fills: after the join window, house bots
+  // take whatever guest seats are still empty.
+  const armFillTimer = (room: Room): void => {
+    if (room.fillTimer) return
+    const startedTable = room.table
+    room.fillTimer = setTimeout(() => {
+      room.fillTimer = null
+      if (room.table !== startedTable || startedTable.state !== 'waiting') return
+      const used = new Set(startedTable.seats.map((s) => s.id))
+      const fillers = AGENT_NAMES.filter((n) => !used.has(n)).slice(
+        0,
+        Math.max(0, startedTable.targetSeats - startedTable.seats.length),
+      )
+      if (!fillers.length) return
+      startedTable.emitSystem('house_filling', { players: fillers })
+      void Promise.allSettled(fillers.map((name) => runAgent(name, { serverUrl: SERVER_URL, room: room.id })))
+    }, JOIN_WINDOW_MS)
+  }
   const bettingOpen = (room: Room): boolean =>
     (room.table.state === 'waiting' || room.table.state === 'playing') && room.table.seats.length > 0
 
@@ -173,6 +192,7 @@ export function createTableApp(treasury: Wallet): TableAppContext {
       swapTable(room, seatCount)
     }
     const openSeats = seatCount - houseSeats
+    // Cards stay visible to spectators only when every seat is a house bot.
     room.table.hideHoleCards = openSeats > 0
     const names = AGENT_NAMES.slice(0, houseSeats)
     room.demoRunning = names.length > 0
@@ -204,21 +224,7 @@ export function createTableApp(treasury: Wallet): TableAppContext {
 
     // Open seats wait for outside agents; house bots fill whatever is left
     // when the join window closes so the match always starts.
-    if (openSeats > 0) {
-      const startedTable = room.table
-      room.fillTimer = setTimeout(() => {
-        room.fillTimer = null
-        if (room.table !== startedTable || startedTable.state !== 'waiting') return
-        const used = new Set(startedTable.seats.map((s) => s.id))
-        const fillers = AGENT_NAMES.filter((n) => !used.has(n)).slice(
-          0,
-          Math.max(0, startedTable.targetSeats - startedTable.seats.length),
-        )
-        if (!fillers.length) return
-        startedTable.emitSystem('house_filling', { players: fillers })
-        void Promise.allSettled(fillers.map((name) => runAgent(name, { serverUrl: SERVER_URL, room: room.id })))
-      }, JOIN_WINDOW_MS)
-    }
+    if (openSeats > 0) armFillTimer(room)
 
     return c.json({ ok: true, players: names, openSeats, room: room.id })
   })
@@ -258,6 +264,11 @@ export function createTableApp(treasury: Wallet): TableAppContext {
       const body = (await c.req.json()) as { playerId: string; address: `0x${string}` }
       try {
         const seat = room.table.join(body.playerId, body.address, lastReceipt)
+        // An agent that sat down at an idle table shouldn't wait forever:
+        // summon house opponents if nobody else shows up in the join window.
+        if (room.table.state === 'waiting' && room.table.seats.length < room.table.targetSeats) {
+          armFillTimer(room)
+        }
         return c.json({ token: seat.token, seat: { id: seat.id, chips: seat.chips }, room: room.id })
       } catch (error) {
         // The buy-in already settled; a race (seat taken mid-payment) refunds it.

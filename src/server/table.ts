@@ -34,13 +34,18 @@ export class Table {
   history: HandResult[] = []
   payouts: Payout[] = []
   events: TableEvent[] = []
-  /** Blank spectator hole cards while a hand is live (rooms open to outside agents). */
-  hideHoleCards = false
+  /**
+   * Blank spectator hole cards while a hand is live. Defaults to hidden so an
+   * outside agent's owner can never peek via the spectator view; explicitly
+   * all-house matches turn it off for entertainment.
+   */
+  hideHoleCards = true
 
   private seq = 0
   private logCursor = 0
   private listeners = new Set<(e: TableEvent) => void>()
   private turnTimer: ReturnType<typeof setTimeout> | null = null
+  private startTimer: ReturnType<typeof setTimeout> | null = null
   private readonly payoutFn: PayoutFn
   readonly targetSeats: number
   readonly actTimeoutMs: number
@@ -55,6 +60,8 @@ export class Table {
   dispose(): void {
     if (this.turnTimer) clearTimeout(this.turnTimer)
     this.turnTimer = null
+    if (this.startTimer) clearTimeout(this.startTimer)
+    this.startTimer = null
     this.listeners.clear()
   }
 
@@ -88,7 +95,15 @@ export class Table {
     this.emit('player_joined', {
       playerId, address, buyIn: formatUsd(BUY_IN_CHIPS), seats: this.seats.length, needed: this.targetSeats,
     })
-    if (this.seats.length >= this.targetSeats) this.startHand()
+    if (this.seats.length >= this.targetSeats && !this.startTimer) {
+      // Short countdown so spectators (and bettors) see the match forming
+      // instead of cards appearing the instant the last seat fills.
+      this.emit('match_starting', { players: this.seats.map((s) => s.id), inSeconds: 3 })
+      this.startTimer = setTimeout(() => {
+        this.startTimer = null
+        if (this.state === 'waiting') this.startHand()
+      }, 3000)
+    }
     return seat
   }
 

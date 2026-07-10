@@ -212,7 +212,7 @@ export function SpectatorTable() {
   const showInvite =
     table.state === 'waiting' &&
     openSeatsRemaining > 0 &&
-    Number(lastDemoStart?.data.openSeats ?? 0) > 0
+    (table.seats.length > 0 || Number(lastDemoStart?.data.openSeats ?? 0) > 0)
   const winnerId = useMemo(() => {
     if (table.state !== 'settled' || !table.payouts.length) return null
     const top = Math.max(...table.payouts.map((p) => p.chips))
@@ -565,7 +565,9 @@ export function SpectatorTable() {
                 </div>
               ) : (
                 <div className="start-block">
-                  <p className="felt-tagline pulse">Seating players…</p>
+                  <p className="felt-tagline pulse">
+                    {players.length >= table.targetSeats ? 'Shuffling up — match starting…' : 'Seating players…'}
+                  </p>
                 </div>
               )}
               </div>
@@ -747,6 +749,8 @@ function describeEvent(event: TableEvent): string | null {
       }
       return `New match: ${players.join(' vs ')}`
     }
+    case 'match_starting':
+      return `Table full — ${(d.players as string[]).join(' vs ')} starting`
     case 'timeout':
       return `${d.playerId} ran out of time — auto-${d.action}`
     case 'house_filling':
