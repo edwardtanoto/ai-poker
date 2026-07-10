@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto'
 import type { Address } from 'viem'
 import {
-  BIG_BLIND, BUY_IN_CHIPS, MAX_HANDS, SMALL_BLIND, TABLE_SEATS, formatUsd,
+  ACT_TIMEOUT_MS, BIG_BLIND, BUY_IN_CHIPS, MAX_HANDS, SMALL_BLIND, TABLE_SEATS, formatUsd,
 } from '../config.js'
 import { Hand, type LegalActions } from '../engine/hand.js'
 import type { Action, Card, HandResult } from '../engine/types.js'
@@ -34,16 +34,28 @@ export class Table {
   history: HandResult[] = []
   payouts: Payout[] = []
   events: TableEvent[] = []
+  /** Blank spectator hole cards while a hand is live (rooms open to outside agents). */
+  hideHoleCards = false
 
   private seq = 0
   private logCursor = 0
   private listeners = new Set<(e: TableEvent) => void>()
+  private turnTimer: ReturnType<typeof setTimeout> | null = null
   private readonly payoutFn: PayoutFn
   readonly targetSeats: number
+  readonly actTimeoutMs: number
 
-  constructor(payoutFn: PayoutFn, targetSeats: number = TABLE_SEATS) {
+  constructor(payoutFn: PayoutFn, targetSeats: number = TABLE_SEATS, actTimeoutMs: number = ACT_TIMEOUT_MS) {
     this.payoutFn = payoutFn
     this.targetSeats = Math.max(2, Math.min(Math.floor(targetSeats) || 2, 4))
+    this.actTimeoutMs = actTimeoutMs
+  }
+
+  /** Stop timers when the table is replaced so an orphan can't keep playing. */
+  dispose(): void {
+    if (this.turnTimer) clearTimeout(this.turnTimer)
+    this.turnTimer = null
+    this.listeners.clear()
   }
 
   subscribe(fn: (e: TableEvent) => void): () => void {
@@ -100,6 +112,31 @@ export class Table {
     this.hand.act(seat.id, action)
     this.flushHandLog()
     if (this.hand.isComplete) this.finishHand()
+    else this.armTurnTimer()
+  }
+
+  /**
+   * A stalled or dead player must not freeze the table: when the act timeout
+   * elapses, the current player checks if legal, otherwise folds.
+   */
+  private armTurnTimer(): void {
+    if (this.turnTimer) clearTimeout(this.turnTimer)
+    this.turnTimer = null
+    if (!this.actTimeoutMs || this.state !== 'playing' || !this.hand) return
+    const playerId = this.hand.currentPlayerId
+    if (!playerId) return
+    this.turnTimer = setTimeout(() => this.autoAct(playerId), this.actTimeoutMs)
+  }
+
+  private autoAct(playerId: string): void {
+    if (this.state !== 'playing' || !this.hand || this.hand.currentPlayerId !== playerId) return
+    const legal = this.hand.legalActions()
+    const action: Action = legal?.canCheck ? { type: 'check' } : { type: 'fold' }
+    this.emit('timeout', { playerId, action: action.type })
+    this.hand.act(playerId, action)
+    this.flushHandLog()
+    if (this.hand.isComplete) this.finishHand()
+    else this.armTurnTimer()
   }
 
   /** Spectators see the whole table; pass a seat for the private agent API view. */
@@ -110,6 +147,7 @@ export class Table {
       state: this.state,
       handNumber: this.handNumber,
       maxHands: MAX_HANDS,
+      targetSeats: this.targetSeats,
       blinds: { small: SMALL_BLIND, big: BIG_BLIND },
       seats: this.seats.map((s) => ({
         id: s.id,
@@ -129,7 +167,7 @@ export class Table {
               status: p.status,
               streetBet: p.streetBet,
               stack: p.stack,
-              holeCards: agentView ? [] : p.holeCards,
+              holeCards: agentView || this.hideHoleCards ? [] : p.holeCards,
             })),
           }
         : null,
@@ -164,6 +202,7 @@ export class Table {
     this.logCursor = 0
     this.flushHandLog()
     if (this.hand.isComplete) this.finishHand()
+    else this.armTurnTimer()
   }
 
   private flushHandLog(): void {
@@ -191,6 +230,8 @@ export class Table {
   }
 
   private async settle(): Promise<void> {
+    if (this.turnTimer) clearTimeout(this.turnTimer)
+    this.turnTimer = null
     this.state = 'settling'
     this.emit('settling', {
       stacks: Object.fromEntries(this.seats.map((s) => [s.id, formatUsd(s.chips)])),

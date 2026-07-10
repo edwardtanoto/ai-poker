@@ -16,6 +16,7 @@ import { HttpError, type Payout } from './table.js'
 export type SpectatorBet = {
   id: string
   spectatorId: string
+  roomId: string
   agentId: string
   /** Stake in chips (pathUSD base units). */
   amount: number
@@ -35,7 +36,7 @@ const MIN_BET_CHIPS = 1 * CHIP_SCALE
 const MAX_BET_CHIPS = 100 * CHIP_SCALE
 const SPECTATOR_ID_RE = /^[a-f0-9]{16,64}$/
 
-type EmitFn = (type: string, data: Record<string, unknown>) => void
+type EmitFn = (roomId: string, type: string, data: Record<string, unknown>) => void
 
 export class BettingBook {
   private readonly treasury: Wallet
@@ -65,6 +66,7 @@ export class BettingBook {
 
   async place(
     spectatorId: string,
+    roomId: string,
     agentId: string,
     amountChips: number,
     context: { seatedIds: string[]; open: boolean; multiplier: number },
@@ -82,6 +84,7 @@ export class BettingBook {
     return this.record({
       id: randomBytes(8).toString('hex'),
       spectatorId: id,
+      roomId,
       agentId,
       amount: amountChips,
       multiplier: context.multiplier,
@@ -97,6 +100,7 @@ export class BettingBook {
    * straight to `payoutAddress` instead of a session wallet.
    */
   placeExternal(
+    roomId: string,
     agentId: string,
     amountChips: number,
     payoutAddress: string,
@@ -109,6 +113,7 @@ export class BettingBook {
     return this.record({
       id: randomBytes(8).toString('hex'),
       spectatorId: `mpp-${randomBytes(8).toString('hex')}`,
+      roomId,
       agentId,
       amount: amountChips,
       multiplier: context.multiplier,
@@ -134,35 +139,35 @@ export class BettingBook {
   private record(bet: SpectatorBet): SpectatorBet {
     this.bets.push(bet)
     if (this.bets.length > 5000) this.bets.shift()
-    this.emit('bet_placed', { agentId: bet.agentId, amount: formatUsd(bet.amount) })
+    this.emit(bet.roomId, 'bet_placed', { agentId: bet.agentId, amount: formatUsd(bet.amount) })
     return bet
   }
 
-  /** Public pools + the caller's bets (never other spectators' identities). */
-  state(spectatorId?: string): { pools: Record<string, number>; myBets: SpectatorBet[] } {
+  /** Public pools + the caller's bets in this room (never other spectators' identities). */
+  state(roomId: string, spectatorId?: string): { pools: Record<string, number>; myBets: SpectatorBet[] } {
     const pools: Record<string, number> = {}
     for (const bet of this.bets) {
-      if (bet.status !== 'open') continue
+      if (bet.status !== 'open' || bet.roomId !== roomId) continue
       pools[bet.agentId] = (pools[bet.agentId] ?? 0) + bet.amount
     }
     const myBets =
       spectatorId && SPECTATOR_ID_RE.test(spectatorId)
-        ? this.bets.filter((b) => b.spectatorId === spectatorId).slice(-10)
+        ? this.bets.filter((b) => b.spectatorId === spectatorId && b.roomId === roomId).slice(-10)
         : []
     return { pools, myBets }
   }
 
-  /** Settles open bets against the match result. Ties refund everyone. */
-  async resolve(payouts: Payout[]): Promise<void> {
+  /** Settles a room's open bets against the match result. Ties refund everyone. */
+  async resolve(roomId: string, payouts: Payout[]): Promise<void> {
     if (this.resolving) return
     this.resolving = true
     try {
-      const open = this.bets.filter((b) => b.status === 'open')
+      const open = this.bets.filter((b) => b.status === 'open' && b.roomId === roomId)
       if (!open.length || !payouts.length) return
       const top = Math.max(...payouts.map((p) => p.chips))
       const winners = payouts.filter((p) => p.chips === top).map((p) => p.playerId)
       if (winners.length !== 1) {
-        await this.refundOpen('tie')
+        await this.refundOpen(roomId, 'tie')
         return
       }
       const winnerId = winners[0]!
@@ -171,7 +176,7 @@ export class BettingBook {
           const prize = bet.amount * bet.multiplier
           bet.payoutTx = await this.treasury.send(await this.payoutTarget(bet), BigInt(prize))
           bet.status = 'won'
-          this.emit('bet_won', { agentId: bet.agentId, amount: formatUsd(prize) })
+          this.emit(roomId, 'bet_won', { agentId: bet.agentId, amount: formatUsd(prize) })
         } else {
           bet.status = 'lost'
         }
@@ -183,9 +188,9 @@ export class BettingBook {
     }
   }
 
-  /** Returns open stakes (e.g. when a match is reset before finishing). */
-  async refundOpen(reason: string): Promise<void> {
-    const open = this.bets.filter((b) => b.status === 'open')
+  /** Returns a room's open stakes (e.g. when a match is reset before finishing). */
+  async refundOpen(roomId: string, reason: string): Promise<void> {
+    const open = this.bets.filter((b) => b.status === 'open' && b.roomId === roomId)
     for (const bet of open) {
       try {
         bet.payoutTx = await this.treasury.send(await this.payoutTarget(bet), BigInt(bet.amount))
@@ -194,7 +199,7 @@ export class BettingBook {
         console.error('[bets] refund failed', error)
       }
     }
-    if (open.length) this.emit('bets_refunded', { count: open.length, reason })
+    if (open.length) this.emit(roomId, 'bets_refunded', { count: open.length, reason })
   }
 
   /** MPP bets pay out to the address the bettor supplied; custodial bets to the session wallet. */

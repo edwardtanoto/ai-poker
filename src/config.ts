@@ -33,6 +33,12 @@ export const BIG_BLIND = Number(process.env.BIG_BLIND ?? 0.2) * CHIP_SCALE
 export const TABLE_SEATS = Number(process.env.TABLE_SEATS ?? 2)
 export const MAX_HANDS = Number(process.env.MAX_HANDS ?? 20)
 
+/** Auto check/fold a player who hasn't acted in this long (0 disables). */
+export const ACT_TIMEOUT_MS = Number(process.env.ACT_TIMEOUT_SECONDS ?? 45) * 1000
+
+/** How long an open-seat room waits for outside agents before house bots fill in. */
+export const JOIN_WINDOW_MS = Number(process.env.JOIN_WINDOW_SECONDS ?? 120) * 1000
+
 export const SERVER_PORT = Number(process.env.PORT ?? 4021)
 export const SERVER_URL = process.env.SERVER_URL ?? `http://localhost:${SERVER_PORT}`
 

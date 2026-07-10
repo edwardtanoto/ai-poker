@@ -13,8 +13,10 @@ import { pickBrain, ruleBrain, type Brain, type BrainInput } from './brain.js'
  *  4. thinks through each decision (Claude brain) and talks at the table,
  *  5. plays until the table settles and the treasury cashes it out on-chain.
  */
-export async function runAgent(playerId: string, options?: { brain?: Brain; serverUrl?: string }) {
+export async function runAgent(playerId: string, options?: { brain?: Brain; serverUrl?: string; room?: string }) {
   const serverUrl = options?.serverUrl ?? SERVER_URL
+  const room = options?.room ?? process.env.POKER_ROOM ?? ''
+  const roomQs = room ? `?room=${encodeURIComponent(room)}` : ''
   const wallet = await openWallet(playerId, `.wallets/${playerId}.json`)
   const brain = options?.brain ?? pickBrain(playerId)
   console.log(`[${playerId}] wallet ${wallet.address} · brain: ${brain.name}`)
@@ -29,7 +31,7 @@ export async function runAgent(playerId: string, options?: { brain?: Brain; serv
 
   const balanceBefore = await wallet.balance()
 
-  const joinRes = await paidFetch(`${serverUrl}/api/table/join`, {
+  const joinRes = await paidFetch(`${serverUrl}/api/table/join${roomQs}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ playerId, address: wallet.address }),
@@ -39,11 +41,11 @@ export async function runAgent(playerId: string, options?: { brain?: Brain; serv
   const balanceAfterJoin = await wallet.balance()
   console.log(`[${playerId}] seated — paid ${formatUsd(Number(balanceBefore - balanceAfterJoin))} buy-in on-chain`)
 
-  const memory = new GameMemory(playerId, serverUrl, token)
+  const memory = new GameMemory(playerId, serverUrl, token, roomQs)
 
   // Main loop: poll, act when it's our turn
   for (;;) {
-    const state = await getState(serverUrl, token)
+    const state = await getState(serverUrl, token, roomQs)
 
     if (state.state === 'settled') {
       const payout = state.payouts.find((p) => p.playerId === playerId)
@@ -85,14 +87,14 @@ export async function runAgent(playerId: string, options?: { brain?: Brain; serv
           console.log(`[${playerId}] 🧠 ${output.thinking.split('\n')[0]?.slice(0, 140)}`)
         }
         if (output.say) console.log(`[${playerId}] 💬 "${output.say}"`)
-        await fetch(`${serverUrl}/api/table/say`, {
+        await fetch(`${serverUrl}/api/table/say${roomQs}`, {
           method: 'POST',
           headers: { 'content-type': 'application/json', 'x-player-token': token },
           body: JSON.stringify({ say: output.say, thinking: output.thinking }),
         }).catch(() => {})
       }
 
-      const res = await fetch(`${serverUrl}/api/table/act`, {
+      const res = await fetch(`${serverUrl}/api/table/act${roomQs}`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', 'x-player-token': token },
         body: JSON.stringify(output.decision),
@@ -116,10 +118,10 @@ export async function runAgent(playerId: string, options?: { brain?: Brain; serv
 class GameMemory {
   lines: string[] = []
   private cursor = 0
-  constructor(private playerId: string, private serverUrl: string, private token: string) {}
+  constructor(private playerId: string, private serverUrl: string, private token: string, private roomQs = '') {}
 
   async refresh(): Promise<void> {
-    const res = await fetch(`${this.serverUrl}/api/table/log`, {
+    const res = await fetch(`${this.serverUrl}/api/table/log${this.roomQs}`, {
       headers: { 'x-player-token': this.token },
     }).catch(() => null)
     if (!res?.ok) return
@@ -183,8 +185,8 @@ type TableState = {
   payouts: { playerId: string; chips: number; txHash?: string }[]
 }
 
-async function getState(serverUrl: string, token: string): Promise<TableState> {
-  const res = await fetch(`${serverUrl}/api/table`, { headers: { 'x-player-token': token } })
+async function getState(serverUrl: string, token: string, roomQs = ''): Promise<TableState> {
+  const res = await fetch(`${serverUrl}/api/table${roomQs}`, { headers: { 'x-player-token': token } })
   if (!res.ok) throw new Error(`state fetch failed: ${res.status}`)
   return (await res.json()) as TableState
 }

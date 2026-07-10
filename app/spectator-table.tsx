@@ -16,10 +16,20 @@ type Player = {
 }
 type TableEvent = { seq: number; time: number; type: string; data: Record<string, unknown> }
 type Payout = { playerId: string; address: string; chips: number; txHash?: string; error?: string }
+type RoomInfo = {
+  id: string
+  name: string
+  state: string
+  players: string[]
+  targetSeats: number
+  openSeats: number
+  handNumber: number
+}
 type TableState = {
   state: 'waiting' | 'playing' | 'settling' | 'settled'
   handNumber: number
   maxHands: number
+  targetSeats: number
   blinds: { small: number; big: number }
   seats: Seat[]
   hand: {
@@ -59,18 +69,29 @@ const initialTable: TableState = {
   state: 'waiting',
   handNumber: 0,
   maxHands: 0,
+  targetSeats: 2,
   blinds: { small: 0, big: 0 },
   seats: [],
   hand: null,
   payouts: [],
 }
 
+function roomFromUrl(): string {
+  if (typeof window === 'undefined') return 'main'
+  return new URLSearchParams(window.location.search).get('room') ?? 'main'
+}
+
 export function SpectatorTable() {
+  // Resolved after mount: the server can't see ?room= during SSR, so
+  // rendering it eagerly would cause a hydration mismatch.
+  const [room, setRoom] = useState<string | null>(null)
+  const [rooms, setRooms] = useState<RoomInfo[]>([])
   const [table, setTable] = useState<TableState>(initialTable)
   const [events, setEvents] = useState<TableEvent[]>([])
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [seatCount, setSeatCount] = useState(2)
+  const [openSeatCount, setOpenSeatCount] = useState(0)
 
   const [spectatorId, setSpectatorId] = useState<string | null>(null)
   const [betState, setBetState] = useState<BetState | null>(null)
@@ -88,23 +109,32 @@ export function SpectatorTable() {
   const betFetchSeq = useRef(0)
   const spectatorRef = useRef<string | null>(null)
 
+  const roomId = room ?? 'main'
+
   const refresh = useCallback(async () => {
+    if (!room) return
     const seq = ++fetchSeq.current
-    const res = await fetch('/api/table', { cache: 'no-store' })
+    const res = await fetch(`/api/table?room=${room}`, { cache: 'no-store' })
     if (!res.ok) throw new Error(`table fetch failed: ${res.status}`)
     const next = (await res.json()) as TableState
     if (seq === fetchSeq.current) setTable(next)
-  }, [])
+  }, [room])
 
   // Same stale-response guard as refresh(): SSE bursts fire many of these and
   // the balance is an on-chain read — a slow old response must not win.
   const refreshBets = useCallback(async () => {
+    if (!room) return
     const id = spectatorRef.current
     const seq = ++betFetchSeq.current
-    const res = await fetch(`/api/bets/state${id ? `?spectatorId=${id}` : ''}`, { cache: 'no-store' })
+    const res = await fetch(`/api/bets/state?room=${room}${id ? `&spectatorId=${id}` : ''}`, { cache: 'no-store' })
     if (!res.ok) return
     const next = (await res.json()) as BetState
     if (seq === betFetchSeq.current) setBetState(next)
+  }, [room])
+
+  const refreshRooms = useCallback(async () => {
+    const res = await fetch('/api/rooms', { cache: 'no-store' }).catch(() => null)
+    if (res?.ok) setRooms((await res.json()) as RoomInfo[])
   }, [])
 
   // Spectator session: server-custodial testnet wallet keyed by a local id.
@@ -130,8 +160,14 @@ export function SpectatorTable() {
   }, [refreshBets])
 
   useEffect(() => {
+    setRoom(roomFromUrl())
+  }, [])
+
+  useEffect(() => {
+    if (!room) return
     void refresh().catch((err) => setError(err instanceof Error ? err.message : String(err)))
-    const source = new EventSource('/api/table/events')
+    void refreshRooms()
+    const source = new EventSource(`/api/table/events?room=${room}`)
     source.onopen = () => setError(null)
     source.onmessage = (message) => {
       const event = JSON.parse(message.data) as TableEvent
@@ -139,9 +175,10 @@ export function SpectatorTable() {
       setEvents((prev) => [...prev.slice(-159), event])
       void refresh()
       void refreshBets()
+      if (event.type === 'demo_started' || event.type === 'settled' || event.type === 'player_joined') void refreshRooms()
     }
     return () => source.close()
-  }, [refresh, refreshBets])
+  }, [refresh, refreshBets, refreshRooms, room])
 
   const players = useMemo(() => {
     return table.seats.map((seat) => {
@@ -170,6 +207,12 @@ export function SpectatorTable() {
 
   const balance = betState?.balance ?? null
   const bettingOpen = Boolean(betState?.open) && table.state === 'playing'
+  const lastDemoStart = useMemo(() => [...events].reverse().find((e) => e.type === 'demo_started'), [events])
+  const openSeatsRemaining = Math.max(0, table.targetSeats - table.seats.length)
+  const showInvite =
+    table.state === 'waiting' &&
+    openSeatsRemaining > 0 &&
+    Number(lastDemoStart?.data.openSeats ?? 0) > 0
   const winnerId = useMemo(() => {
     if (table.state !== 'settled' || !table.payouts.length) return null
     const top = Math.max(...table.payouts.map((p) => p.chips))
@@ -186,14 +229,14 @@ export function SpectatorTable() {
     [betState, myBetIds],
   )
 
-  const startMatch = async (seats: number) => {
+  const startMatch = async (seats: number, openSeats: number) => {
     setBusy(true)
     setError(null)
     try {
-      const res = await fetch('/api/table/start', {
+      const res = await fetch(`/api/table/start?room=${roomId}`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ seats }),
+        body: JSON.stringify({ seats, houseSeats: seats - openSeats }),
       })
       if (!res.ok) throw new Error(await res.text())
       await refresh()
@@ -208,10 +251,23 @@ export function SpectatorTable() {
     setBusy(true)
     setError(null)
     try {
-      await fetch('/api/table/reset', { method: 'POST' })
+      await fetch(`/api/table/reset?room=${roomId}`, { method: 'POST' })
       setEvents([])
-      await startMatch(seatCount)
+      await startMatch(seatCount, openSeatCount)
     } finally {
+      setBusy(false)
+    }
+  }
+
+  const createRoom = async () => {
+    setBusy(true)
+    try {
+      const res = await fetch('/api/rooms', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
+      const data = (await res.json()) as { id?: string; error?: string }
+      if (!res.ok || !data.id) throw new Error(data.error ?? 'Could not create table')
+      window.location.search = `?room=${data.id}`
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
       setBusy(false)
     }
   }
@@ -246,7 +302,7 @@ export function SpectatorTable() {
     setWalletBusy(true)
     setError(null)
     try {
-      const res = await fetch('/api/bets/place', {
+      const res = await fetch(`/api/bets/place?room=${roomId}`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ spectatorId, agentId: pickedAgent, amount: betAmount }),
@@ -310,6 +366,9 @@ export function SpectatorTable() {
       <header className="topbar">
         <div className="brand">
           <span className="brand-suit">♠</span> Poker Arena
+          <a className="agent-link" href="/agents.md" title="Send your own AI agent to play">
+            Bring your agent
+          </a>
         </div>
         {table.state === 'playing' && table.hand ? (
           <div className="hand-note">
@@ -397,6 +456,18 @@ export function SpectatorTable() {
       </header>
 
       <main className="floor">
+        <div className="room-strip" aria-label="Tables">
+          {(rooms.length ? rooms : [{ id: 'main', name: 'Main table', state: 'waiting', players: [], targetSeats: 2, openSeats: 0, handNumber: 0 }]).map((r) => (
+            <a key={r.id} className={`room-chip ${r.id === roomId ? 'selected' : ''}`} href={r.id === 'main' ? '/' : `/?room=${r.id}`}>
+              {r.state === 'playing' ? <span className="room-live" /> : null}
+              {r.name}
+            </a>
+          ))}
+          <button type="button" className="room-chip room-new" onClick={createRoom} disabled={busy}>
+            + New table
+          </button>
+        </div>
+
         <div className="table-zone">
           <div className="table-wrap">
             <div className="pods">
@@ -439,22 +510,56 @@ export function SpectatorTable() {
                     {busy ? 'Dealing…' : 'Play again'}
                   </button>
                 </div>
-              ) : table.state === 'waiting' && players.length === 0 && !busy ? (
+              ) : showInvite ? (
+                <div className="start-block">
+                  <p className="felt-tagline pulse">
+                    {openSeatsRemaining} seat{openSeatsRemaining === 1 ? '' : 's'} open for outside agents
+                  </p>
+                  <p className="invite-copy">
+                    Tell your AI: “Read <a href="/agents.md">{host()}/agents.md</a> and join room <strong>{roomId}</strong>.”
+                  </p>
+                  <p className="invite-sub">House bots fill any empty seats in ~2 minutes.</p>
+                </div>
+              ) : table.state === 'waiting' && players.length === 0 && !busy && !lastDemoStart ? (
                 <div className="start-block">
                   <p className="felt-tagline">AI pros. Real chips. One winner.</p>
-                  <div className="seat-choice" role="group" aria-label="Players at the table">
-                    {[2, 3, 4].map((n) => (
-                      <button
-                        key={n}
-                        type="button"
-                        className={seatCount === n ? 'selected' : ''}
-                        onClick={() => setSeatCount(n)}
-                      >
-                        {n}
-                      </button>
-                    ))}
+                  <div className="picker-grid">
+                    <div>
+                      <span className="picker-caption">Players</span>
+                      <div className="seat-choice" role="group" aria-label="Players at the table">
+                        {[2, 3, 4].map((n) => (
+                          <button
+                            key={n}
+                            type="button"
+                            className={seatCount === n ? 'selected' : ''}
+                            onClick={() => {
+                              setSeatCount(n)
+                              setOpenSeatCount((o) => Math.min(o, n))
+                            }}
+                          >
+                            {n}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                    <div>
+                      <span className="picker-caption">Guest seats</span>
+                      <div className="seat-choice" role="group" aria-label="Seats open for outside agents">
+                        {[0, 1, 2].map((n) => (
+                          <button
+                            key={n}
+                            type="button"
+                            className={openSeatCount === n ? 'selected' : ''}
+                            disabled={n > seatCount}
+                            onClick={() => setOpenSeatCount(n)}
+                          >
+                            {n === 0 ? '—' : n}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
                   </div>
-                  <button type="button" className="cta" onClick={() => startMatch(seatCount)}>
+                  <button type="button" className="cta" onClick={() => startMatch(seatCount, openSeatCount)}>
                     Start match
                   </button>
                 </div>
@@ -626,11 +731,26 @@ const ACTION_VERBS: Record<string, (amount: number) => string> = {
   allin: () => 'goes all in',
 }
 
+function host(): string {
+  if (typeof window === 'undefined') return 'poker.100ai.id'
+  return window.location.host
+}
+
 function describeEvent(event: TableEvent): string | null {
   const d = event.data
   switch (event.type) {
-    case 'demo_started':
-      return `New match: ${(d.players as string[]).join(' vs ')}`
+    case 'demo_started': {
+      const players = (d.players as string[]) ?? []
+      const openSeats = Number(d.openSeats ?? 0)
+      if (openSeats > 0) {
+        return `Match opening: ${players.length ? players.join(', ') + ' seated, ' : ''}${openSeats} guest seat${openSeats === 1 ? '' : 's'} open`
+      }
+      return `New match: ${players.join(' vs ')}`
+    }
+    case 'timeout':
+      return `${d.playerId} ran out of time — auto-${d.action}`
+    case 'house_filling':
+      return `House bots step in: ${(d.players as string[]).join(', ')}`
     case 'player_joined':
       return `${d.playerId} sits down`
     case 'hand_start':
