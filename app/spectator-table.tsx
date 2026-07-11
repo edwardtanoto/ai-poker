@@ -104,6 +104,8 @@ export function SpectatorTable() {
   const [payoutAddr, setPayoutAddr] = useState('')
   const [depositAddr, setDepositAddr] = useState<string | null>(null)
   const [walletNote, setWalletNote] = useState<string | null>(null)
+  const [roomsOpen, setRoomsOpen] = useState(false)
+  const [roomQuery, setRoomQuery] = useState('')
 
   const fetchSeq = useRef(0)
   const betFetchSeq = useRef(0)
@@ -456,17 +458,16 @@ export function SpectatorTable() {
       </header>
 
       <main className="floor">
-        <div className="room-strip" aria-label="Tables">
-          {(rooms.length ? rooms : [{ id: 'main', name: 'Main table', state: 'waiting', players: [], targetSeats: 2, openSeats: 0, handNumber: 0 }]).map((r) => (
-            <a key={r.id} className={`room-chip ${r.id === roomId ? 'selected' : ''}`} href={r.id === 'main' ? '/' : `/?room=${r.id}`}>
-              {r.state === 'playing' ? <span className="room-live" /> : null}
-              {r.name}
-            </a>
-          ))}
-          <button type="button" className="room-chip room-new" onClick={createRoom} disabled={busy}>
-            + New table
-          </button>
-        </div>
+        <RoomSwitcher
+          rooms={rooms}
+          roomId={roomId}
+          open={roomsOpen}
+          setOpen={setRoomsOpen}
+          query={roomQuery}
+          setQuery={setRoomQuery}
+          onNew={createRoom}
+          busy={busy}
+        />
 
         <div className="table-zone">
           <div className="table-wrap">
@@ -640,6 +641,96 @@ export function SpectatorTable() {
           )}
         </div>
       </main>
+    </div>
+  )
+}
+
+function RoomSwitcher({
+  rooms,
+  roomId,
+  open,
+  setOpen,
+  query,
+  setQuery,
+  onNew,
+  busy,
+}: {
+  rooms: RoomInfo[]
+  roomId: string
+  open: boolean
+  setOpen: (v: boolean | ((p: boolean) => boolean)) => void
+  query: string
+  setQuery: (v: string) => void
+  onNew: () => void
+  busy: boolean
+}) {
+  const fallback: RoomInfo = { id: 'main', name: 'Main table', state: 'waiting', players: [], targetSeats: 2, openSeats: 0, handNumber: 0 }
+  const all = rooms.length ? rooms : [fallback]
+  const current = all.find((r) => r.id === roomId) ?? fallback
+  const liveCount = all.filter((r) => r.state === 'playing').length
+
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase()
+    const matched = q ? all.filter((r) => r.name.toLowerCase().includes(q) || r.id.includes(q)) : all
+    // Live tables first, then open-seat tables, then the rest — all by name.
+    const rank = (r: RoomInfo) => (r.state === 'playing' ? 0 : r.openSeats > 0 ? 1 : 2)
+    return [...matched].sort((a, b) => rank(a) - rank(b) || a.name.localeCompare(b.name))
+  }, [all, query])
+
+  return (
+    <div className="room-switch">
+      <button type="button" className="room-switch-btn" onClick={() => setOpen((v) => !v)} aria-expanded={open}>
+        {current.state === 'playing' ? <span className="room-live" /> : null}
+        <span className="room-switch-name">{current.name}</span>
+        <span className="room-switch-count">{all.length}</span>
+        <span className={`room-switch-caret ${open ? 'up' : ''}`}>⌄</span>
+      </button>
+
+      {open ? (
+        <>
+          <button type="button" className="room-scrim" aria-label="Close" onClick={() => setOpen(false)} />
+          <div className="room-menu" role="menu">
+            <div className="room-menu-head">
+              <span>{liveCount} live · {all.length} table{all.length === 1 ? '' : 's'}</span>
+              <button type="button" className="room-menu-new" onClick={onNew} disabled={busy}>
+                + New table
+              </button>
+            </div>
+            {all.length > 6 ? (
+              <input
+                className="room-menu-search"
+                placeholder="Search tables…"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                spellCheck={false}
+              />
+            ) : null}
+            <div className="room-menu-list">
+              {filtered.map((r) => (
+                <a
+                  key={r.id}
+                  className={`room-row ${r.id === roomId ? 'selected' : ''}`}
+                  href={r.id === 'main' ? '/' : `/?room=${r.id}`}
+                  role="menuitem"
+                >
+                  <span className={`room-dot ${r.state}`} />
+                  <span className="room-row-name">{r.name}</span>
+                  <span className="room-row-meta">
+                    {r.state === 'playing'
+                      ? `${r.players.length} playing`
+                      : r.openSeats > 0
+                        ? `${r.openSeats} seat${r.openSeats === 1 ? '' : 's'} open`
+                        : r.state === 'settled'
+                          ? 'finished'
+                          : 'idle'}
+                  </span>
+                </a>
+              ))}
+              {filtered.length === 0 ? <p className="room-empty">No tables match.</p> : null}
+            </div>
+          </div>
+        </>
+      ) : null}
     </div>
   )
 }
